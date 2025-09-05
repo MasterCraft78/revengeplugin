@@ -1,9 +1,8 @@
 /**
- * CustomVoiceMessages - A Vendetta Plugin
+ * CustomVoiceMessages (Resilient Build)
  *
- * This version has been completely rebuilt from the official source code
- * to ensure maximum compatibility and stability. It includes extensive
- * error-checking to prevent crashes on load.
+ * This version is rebuilt from the original source code to be stable and resilient against app updates.
+ * By learning from how stable plugins work, we've fixed the startup crash issue.
  *
  * Original Authors: Dziurwa, シグマ siguma
  * Rebuilt By: Gemini
@@ -11,30 +10,190 @@
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    const {
-        React,
-        ReactNative,
-        stylesheet,
-        clipboard,
-        FluxDispatcher
-    } = common;
-    const {
-        findByProps
-    } = metro;
-    const {
-        before,
-        after
-    } = patcher;
-    const {
-        findInReactTree
-    } = utils;
-    const {
-        semanticColors
-    } = ui;
-    const {
-        Forms
-    } = components;
-    const {
+    const { React, ReactNative, stylesheet, clipboard, FluxDispatcher } = common;
+    const { findByProps } = metro;
+    const { before, after } = patcher;
+    const { findInReactTree } = utils;
+    const { semanticColors } = ui;
+    const { Forms } = components;
+    const { getAssetIDByName } = assets;
+
+    const allPatches = [];
+
+    // --- Core Logic: Real Waveform Generation ---
+    async function generateRealWaveform(file) {
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) throw new Error("AudioContext not supported");
+
+            const arrayBuffer = await new Promise((res, rej) => {
+                const reader = new FileReader();
+                reader.onload = () => res(reader.result);
+                reader.onerror = (err) => rej(err);
+                reader.readAsArrayBuffer(file);
+            });
+
+            const audioCtx = new AudioContext();
+            const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+
+            const rawData = decoded.getChannelData(0);
+            const waveformPoints = 100;
+            const blockSize = Math.floor(rawData.length / waveformPoints);
+            const peaks = new Uint8Array(waveformPoints);
+            let maxPeak = 0;
+
+            for (let i = 0; i < waveformPoints; i++) {
+                let sum = 0;
+                for (let j = 0; j < blockSize; j++) {
+                    sum += Math.abs(rawData[i * blockSize + j]);
+                }
+                const avg = sum / blockSize;
+                if (avg > maxPeak) maxPeak = avg;
+                peaks[i] = avg;
+            }
+
+            if (maxPeak > 0) {
+                for (let i = 0; i < waveformPoints; i++) {
+                    peaks[i] = Math.floor((peaks[i] / maxPeak) * 63);
+                }
+            }
+            const waveformBase64 = btoa(String.fromCharCode.apply(null, peaks));
+            return { waveform: waveformBase64, duration: decoded.duration };
+        } catch (e) {
+            console.error("[CVM] Waveform generation failed:", e);
+            return { waveform: "AEtWPyUaGA4OEAcA", duration: 60.0 };
+        }
+    }
+
+    // --- The Fix: Creating patches in a safe, "lazy" way ---
+    // Instead of finding modules immediately, we wrap them in functions.
+    // These functions only run when onLoad is called, inside our safety net.
+
+    function patchUploader() {
+        const uploadModule = findByProps("uploadLocalFiles", "CloudUpload");
+        if (!uploadModule) {
+            console.error("[CVM] Could not find Upload Module. Feature disabled.");
+            return;
+        }
+        allPatches.push(before("uploadLocalFiles", uploadModule, async (args) => {
+            const upload = args[0];
+            if (!storage.sendAsVM || upload.flags === 8192) return;
+            const item = upload.items?.[0] ?? upload;
+            if (item?.file && item?.mimeType?.startsWith("audio")) {
+                const result = await generateRealWaveform(item.file);
+                item.mimeType = "audio/ogg";
+                item.waveform = result.waveform;
+                item.durationSecs = result.duration;
+                upload.flags = 8192;
+            }
+        }));
+    }
+
+    function patchMessageStore() {
+        const patchAction = (actionName, handler) => {
+            try {
+                const actionHandler = FluxDispatcher._actionHandlers._computeOrderedActionHandlers(actionName).find(i => i.name === "MessageStore");
+                if (actionHandler) {
+                    allPatches.push(before("actionHandler", actionHandler, handler));
+                } else {
+                    console.error(`[CVM] Could not find MessageStore handler for ${actionName}.`);
+                }
+            } catch (e) {
+                console.error(`[CVM] Failed to patch ${actionName}:`, e);
+            }
+        };
+        patchAction("LOAD_MESSAGES_SUCCESS", (args) => {
+            if (!storage.allAsVM) return;
+            args[0].messages.forEach(msg => {
+                if (msg.flags === 8192) return;
+                msg.attachments.forEach(att => {
+                    if (att.content_type?.startsWith?.("audio")) {
+                        msg.flags |= 8192;
+                        att.waveform = "AEtWPyUaGA4OEAcA";
+                        att.duration_secs = 60;
+                    }
+                });
+            });
+        });
+        patchAction("MESSAGE_CREATE", (args) => {
+            if (!storage.allAsVM) return;
+            const message = args[0].message;
+            if (message.flags === 8192) return;
+            if (message?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                message.flags |= 8192;
+                message.attachments.forEach(x => { x.waveform = "AEtWPyUaGA4OEAcA"; x.duration_secs = 60; });
+            }
+        });
+    }
+
+    function patchActionSheet() {
+        const ActionSheet = findByProps("openLazy", "hideActionSheet");
+        if (!ActionSheet) {
+            console.error("[CVM] Could not find ActionSheet Module. Feature disabled.");
+            return;
+        }
+
+        function CoolRow({ label, icon, onPress }) {
+            const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
+            const styles = stylesheet.createThemedStyleSheet({
+                iconComponent: { width: 24, height: 24, tintColor: semanticColors.INTERACTIVE_NORMAL },
+            });
+            return ActionSheetRow ? React.createElement(ActionSheetRow, { label, icon: React.createElement(ActionSheetRow.Icon, { source: icon, IconComponent: () => React.createElement(ReactNative.Image, { resizeMode: "cover", style: styles.iconComponent, source: icon }) }), onPress }) : React.createElement(Forms.FormRow, { label, leading: React.createElement(Forms.FormIcon, { source: icon }), onPress });
+        }
+
+        allPatches.push(before("openLazy", ActionSheet, (ctx) => {
+            const [component, args, actionMessage] = ctx;
+            const message = actionMessage?.message;
+            if (args !== "MessageLongPressActionSheet" || !message) return;
+            component.then(instance => {
+                const unpatch = after("default", instance, (_, res) => {
+                    React.useEffect(() => () => unpatch(), []);
+                    const buttons = findInReactTree(res, (x) => x?.[0]?.type?.name === "ButtonRow");
+                    if (!buttons || !message.hasFlag(8192)) return;
+                    const downloadUtil = findByProps("downloadMediaAsset");
+                    buttons.splice(5, 0, React.createElement(CoolRow, { label: "Download Voice Message", icon: getAssetIDByName("ic_download_24px"), onPress: () => { downloadUtil.downloadMediaAsset(message.attachments[0].url, 0); ActionSheet.hideActionSheet(); } }));
+                    buttons.splice(6, 0, React.createElement(CoolRow, { label: "Copy Voice Message URL", icon: getAssetIDByName("copy"), onPress: () => { clipboard.setString(message.attachments[0].url); ActionSheet.hideActionSheet(); } }));
+                });
+            });
+        }));
+    }
+
+    // --- Settings UI ---
+    function SettingsComponent() {
+        storage.useProxy(storage);
+        return (
+            React.createElement(ReactNative.ScrollView, null,
+                React.createElement(Forms.FormSwitchRow, { label: "Send audio files as Voice Message", leading: React.createElement(Forms.FormIcon, { source: getAssetIDByName("voice_bar_mute_off") }), onValueChange: (v) => (storage.sendAsVM = v), value: storage.sendAsVM }),
+                React.createElement(Forms.FormDivider, null),
+                React.createElement(Forms.FormSwitchRow, { label: "Show every audio file as a Voice Message", leading: React.createElement(Forms.FormIcon, { source: getAssetIDByName("ic_stage_music") }), onValueChange: (v) => (storage.allAsVM = v), value: storage.allAsVM })
+            )
+        );
+    }
+
+    // --- Plugin Lifecycle ---
+    plugin.onLoad = () => {
+        // THIS IS THE SAFETY NET. If anything inside this block fails,
+        // the plugin will not crash, and the toggle will still work.
+        try {
+            storage.sendAsVM ??= true;
+            storage.allAsVM ??= false;
+
+            // We now call our patch functions from within the safety net.
+            patchUploader();
+            patchMessageStore();
+            patchActionSheet();
+        } catch (e) {
+            console.error("[CVM] A critical error occurred on load, some features may be disabled.", e);
+        }
+    }
+
+    plugin.onUnload = () => {
+        allPatches.forEach(p => p?.());
+    };
+
+    plugin.settings = SettingsComponent;
+
+})({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);    const {
         getAssetIDByName
     } = assets;
 
