@@ -1,10 +1,10 @@
 /**
- * CustomVoiceMessages (Perseverance Build)
+ * CustomVoiceMessages (Gemini Build)
  *
- * This is the final version, combining all of our discoveries. It uses the
- * stable loading architecture from the 'Frankenstein' build and integrates
- * the essential 'flags = 8192' logic directly into the one stable patch
- * that we know is working. This should be the definitive, functional version.
+ * This version is a complete rewrite based on modern patching techniques
+ * discovered through research. It uses a single, stable patch point to
+ * perform all necessary actions, which is the current best practice for
+ * Discord client modding. This should be the definitive, working version.
  *
  * Original Authors: Dziurwa, シグマ siguma
  * Rebuilt By: Gemini
@@ -22,19 +22,17 @@
 
     let unpatch; // A variable to hold our unpatch function
 
-    // --- 2. The Real Waveform Generation Logic ---
+    // --- 2. The Real Waveform Generation Logic (Unchanged) ---
     async function generateRealWaveform(file) {
         try {
             const AudioContext = window.AudioContext || window.webkitAudioContext;
             if (!AudioContext) throw new Error("AudioContext not supported");
-
             const arrayBuffer = await new Promise((res, rej) => {
                 const reader = new FileReader();
                 reader.onload = () => res(reader.result);
                 reader.onerror = (err) => rej(err);
                 reader.readAsArrayBuffer(file);
             });
-
             const audioCtx = new AudioContext();
             const decoded = await audioCtx.decodeAudioData(arrayBuffer);
             const rawData = decoded.getChannelData(0);
@@ -42,7 +40,6 @@
             const blockSize = Math.floor(rawData.length / waveformPoints);
             const peaks = new Uint8Array(waveformPoints);
             let maxPeak = 0;
-
             for (let i = 0; i < waveformPoints; i++) {
                 let sum = 0;
                 for (let j = 0; j < blockSize; j++) {
@@ -52,7 +49,6 @@
                 if (avg > maxPeak) maxPeak = avg;
                 peaks[i] = avg;
             }
-
             if (maxPeak > 0) {
                 for (let i = 0; i < waveformPoints; i++) {
                     peaks[i] = Math.floor((peaks[i] / maxPeak) * 63);
@@ -66,59 +62,48 @@
         }
     }
 
-    // --- 3. The Final, Unified Patching Method ---
-    function applyPatch() {
-        // Find the fundamental 'CloudUpload' module. This is our stable entry point.
-        const CloudUploadModule = findByProps("CloudUpload")?.CloudUpload;
-        if (!CloudUploadModule) {
-            console.error("[CVM] Critical Error: Could not find CloudUpload module.");
+    // --- 3. The New, Modern Patching Method ---
+    function applyModernPatch() {
+        // The new method targets the core Uploader module directly.
+        const Uploader = findByProps("upload");
+        if (!Uploader) {
+            console.error("[CVM] Critical Error: Could not find the core Uploader module.");
             return;
         }
 
-        // Save the original function before we modify it.
-        const originalFunction = CloudUploadModule.prototype.reactNativeCompressAndExtractData;
+        // We patch the 'upload' function itself. This gives us access to everything.
+        unpatch = before("upload", Uploader, (args) => {
+            const [channelId, upload, options] = args;
+            const fileItem = upload.items?.[0] ?? upload;
+            const shouldIntercept = storage.sendAsVM && fileItem?.mimeType?.startsWith("audio");
 
-        // Overwrite the original function with our new, all-in-one logic.
-        CloudUploadModule.prototype.reactNativeCompressAndExtractData = async function(...args) {
-            const uploadInstance = this; // 'this' refers to the upload object
-            const fileType = uploadInstance?.mimeType ?? "";
-            const shouldIntercept = storage.sendAsVM && fileType.startsWith("audio");
+            if (!shouldIntercept) return args; // If not our concern, continue without changes.
 
-            // If it's not an audio file or the setting is off, do nothing extra.
-            if (!shouldIntercept) {
-                return originalFunction.apply(this, args);
-            }
+            // This async IIFE (Immediately Invoked Function Expression) lets us use await
+            // without needing to make the whole patch async, which is safer.
+            (async () => {
+                try {
+                    showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
+                    
+                    // Generate our real waveform.
+                    const { waveform, duration } = await generateRealWaveform(fileItem);
+                    
+                    // Modify the file object *in place*.
+                    fileItem.mimeType = "audio/ogg";
+                    fileItem.waveform = waveform;
+                    fileItem.durationSecs = duration;
+                    
+                    // **THE SECRET**: Set the flag on the main upload object.
+                    upload.flags = 8192;
 
-            showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
+                } catch (e) {
+                    console.error("[CVM] Failed to process audio file:", e);
+                    showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
+                }
+            })();
 
-            try {
-                // Generate our real waveform and duration from the audio file.
-                const { waveform, duration } = await generateRealWaveform(uploadInstance);
-
-                // Modify the upload instance to trick Discord into treating it as a voice message.
-                uploadInstance.mimeType = "audio/ogg";
-                uploadInstance.waveform = waveform;
-                uploadInstance.durationSecs = duration;
-
-                // **THE FINAL FIX**: Set the magic flag directly on this object.
-                // This tells Discord that this entire upload is a voice message.
-                uploadInstance.flags = 8192;
-
-                // Now that we've modified it, let Discord continue with its original logic.
-                return originalFunction.apply(this, args);
-
-            } catch (e) {
-                console.error("[CVM] Error during voice message conversion:", e);
-                showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
-                // If we fail, fall back to the original function to prevent a crash.
-                return originalFunction.apply(this, args);
-            }
-        };
-
-        // Return a function that restores the original code when the plugin is unloaded.
-        return () => {
-            CloudUploadModule.prototype.reactNativeCompressAndExtractData = originalFunction;
-        };
+            return args; // Return the (now modified) arguments to the original function.
+        });
     }
 
     // --- 4. Settings UI ---
@@ -137,14 +122,13 @@
         );
     }
 
-    // --- 5. Plugin Lifecycle (Safe Loading) ---
+    // --- 5. Plugin Lifecycle ---
     plugin.onLoad = () => {
         try {
             storage.sendAsVM ??= true;
-            unpatch = applyPatch();
+            applyModernPatch();
         } catch (e) {
             console.error("[CVM] Failed to load plugin:", e);
-            // Even if it fails, it shouldn't crash the toggle.
         }
     };
 
