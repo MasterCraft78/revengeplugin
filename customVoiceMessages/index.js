@@ -1,238 +1,314 @@
 /**
  * CustomVoiceMessages - A Vendetta Plugin
  *
- * Original Author: Unknown
- * Fixed By: Gemini (Robust Version)
+ * This version has been completely rebuilt from the official source code
+ * to ensure maximum compatibility and stability. It includes extensive
+ * error-checking to prevent crashes on load.
  *
- * This plugin allows sending audio files as if they were native voice messages
- * and optionally displays all audio files as voice messages.
- *
- * ROBUST VERSION:
- * - Added extensive error checking to prevent the plugin from crashing on load.
- * - Checks for the existence of modules and functions before patching.
- * - Wraps audio processing in a try/catch block to handle decoding errors gracefully.
- * - Simplified waveform generation for broader compatibility.
+ * Original Authors: Dziurwa, シグマ siguma
+ * Rebuilt By: Gemini
  */
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    // --- Core Audio Processing ---
-    const getAudioMetadata = (file) => {
-        // Check for Web Audio API support
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContext) {
-            console.error("[CustomVoiceMessages] Web Audio API not supported in this environment.");
-            return Promise.reject("AudioContext not supported.");
-        }
+    const {
+        React,
+        ReactNative,
+        stylesheet,
+        clipboard,
+        FluxDispatcher
+    } = common;
+    const {
+        findByProps
+    } = metro;
+    const {
+        before,
+        after
+    } = patcher;
+    const {
+        findInReactTree
+    } = utils;
+    const {
+        semanticColors
+    } = ui;
+    const {
+        Forms
+    } = components;
+    const {
+        getAssetIDByName
+    } = assets;
 
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = async (event) => {
-                const arrayBuffer = event.target.result;
-                if (!arrayBuffer) return reject("Failed to read file.");
+    const allPatches = [];
 
-                try {
-                    const audioContext = new AudioContext();
-                    const buffer = await audioContext.decodeAudioData(arrayBuffer);
-
-                    const duration = buffer.duration;
-                    const channelData = buffer.getChannelData(0);
-                    const waveformPoints = 100;
-                    const samples = new Uint8Array(waveformPoints);
-                    const blockSize = Math.floor(channelData.length / waveformPoints);
-                    let maxAmp = 0;
-
-                    // Simplified amplitude calculation
-                    const amps = [];
-                    for (let i = 0; i < waveformPoints; i++) {
-                        const start = i * blockSize;
-                        let sum = 0;
-                        for (let j = 0; j < blockSize; j++) {
-                            sum += Math.abs(channelData[start + j]);
-                        }
-                        const amp = sum / blockSize;
-                        amps.push(amp);
-                        if (amp > maxAmp) maxAmp = amp;
-                    }
-
-                    // Normalize to 6-bit (0-63)
-                    if (maxAmp > 0) {
-                        for (let i = 0; i < waveformPoints; i++) {
-                            samples[i] = Math.floor((amps[i] / maxAmp) * 63);
-                        }
-                    }
-
-                    const waveform = btoa(String.fromCharCode.apply(null, samples));
-                    resolve({
-                        duration: Math.round(duration),
-                        waveform
-                    });
-                } catch (err) {
-                    console.error("[CustomVoiceMessages] Error decoding audio data:", err);
-                    reject(err);
-                }
-            };
-            reader.onerror = (error) => reject(error);
-            reader.readAsArrayBuffer(file);
+    // --- 1. UI Components (from CoolRow.tsx) ---
+    function CoolRow({
+        label,
+        icon,
+        onPress
+    }) {
+        const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
+        const styles = stylesheet.createThemedStyleSheet({
+            iconComponent: {
+                width: 24,
+                height: 24,
+                tintColor: semanticColors.INTERACTIVE_NORMAL,
+            },
         });
-    };
 
-    // --- Patching Logic ---
-    const patches = [];
+        return ActionSheetRow ? (
+            React.createElement(ActionSheetRow, {
+                label: label,
+                icon: React.createElement(ActionSheetRow.Icon, {
+                    source: icon,
+                    IconComponent: () => React.createElement(ReactNative.Image, {
+                        resizeMode: "cover",
+                        style: styles.iconComponent,
+                        source: icon,
+                    }),
+                }),
+                onPress: () => onPress?.(),
+            })
+        ) : (
+            React.createElement(Forms.FormRow, {
+                label: label,
+                leading: React.createElement(Forms.FormRow.Icon, {
+                    source: icon
+                }),
+                onPress: () => onPress?.(),
+            })
+        );
+    }
 
-    // Patches the file upload process
+    // --- 2. Patches ---
+
+    // From voiceMessages.ts
     function patchUploader() {
-        const uploadModule = metro.findByProps("uploadLocalFiles", "CloudUpload");
-        if (!uploadModule) {
-            console.error("[CustomVoiceMessages] Could not find upload module.");
-            return;
+        async function generateWaveform(file) {
+            try {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContext) throw new Error("AudioContext not supported");
+
+                const arrayBuffer = await new Promise((res, rej) => {
+                    const reader = new FileReader();
+                    reader.onload = () => res(reader.result);
+                    reader.onerror = (err) => rej(err);
+                    reader.readAsArrayBuffer(file);
+                });
+
+                const audioCtx = new AudioContext();
+                const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+
+                const rawData = decoded.getChannelData(0);
+                const blockSize = Math.floor(rawData.length / 100);
+                const peaks = new Uint8Array(100);
+                let maxPeak = 0;
+
+                for (let i = 0; i < 100; i++) {
+                    let sum = 0;
+                    for (let j = 0; j < blockSize; j++) {
+                        sum += Math.abs(rawData[i * blockSize + j]);
+                    }
+                    const avg = sum / blockSize;
+                    peaks[i] = avg;
+                    if (avg > maxPeak) maxPeak = avg;
+                }
+
+                if (maxPeak > 0) {
+                    for (let i = 0; i < 100; i++) {
+                        peaks[i] = Math.floor((peaks[i] / maxPeak) * 63);
+                    }
+                }
+
+                const waveformBase64 = btoa(String.fromCharCode.apply(null, peaks));
+                return {
+                    waveform: waveformBase64,
+                    duration: decoded.duration
+                };
+            } catch (e) {
+                console.error("[CustomVoiceMessages] Waveform generation failed:", e);
+                return {
+                    waveform: "AEtWPyUaGA4OEAcA",
+                    duration: 60.0
+                };
+            }
         }
 
-        const patchInstead = (funcName) => {
-            try {
-                patches.push(patcher.instead(funcName, uploadModule, async (args, originalFunc) => {
-                    const uploadData = args[0];
-                    if (!self.storage.sendAsVM || uploadData.flags === 8192) {
-                        return originalFunc.apply(this, args);
-                    }
+        const patchMethod = (method) => {
+            const uploadModule = findByProps(method);
+            if (!uploadModule) {
+                console.error(`[CustomVoiceMessages] Could not find ${method} module to patch.`);
+                return;
+            }
+            allPatches.push(before(method, uploadModule, async (args) => {
+                const upload = args[0];
+                if (!storage.sendAsVM || upload.flags === 8192) return;
 
-                    const item = uploadData.items?.[0] ?? uploadData;
-                    if (item?.file && item?.mimeType?.startsWith("audio")) {
-                        try {
-                            const {
-                                duration,
-                                waveform
-                            } = await getAudioMetadata(item.file);
-                            item.durationSecs = duration;
-                            item.waveform = waveform;
-                            item.mimeType = "audio/ogg";
-                            uploadData.flags = 8192;
-                        } catch (err) {
-                            console.error("[CustomVoiceMessages] Failed to process audio, sending as regular file.", err);
-                        }
-                    }
-                    return originalFunc.apply(this, args);
-                }));
+                const item = upload.items?.[0] ?? upload;
+                if (item?.file && item?.mimeType?.startsWith("audio")) {
+                    const result = await generateWaveform(item.file);
+                    item.mimeType = "audio/ogg";
+                    item.waveform = result.waveform;
+                    item.durationSecs = result.duration;
+                    upload.flags = 8192;
+                }
+            }));
+        };
+
+        patchMethod("uploadLocalFiles");
+        patchMethod("CloudUpload");
+    }
+
+    // From messagePatches.ts
+    function patchMessageStore() {
+        const patchAction = (actionName, handler) => {
+            try {
+                const actionHandler = FluxDispatcher._actionHandlers._computeOrderedActionHandlers(actionName).find(i => i.name === "MessageStore");
+                if (!actionHandler) {
+                    console.error(`[CustomVoiceMessages] Could not find MessageStore handler for ${actionName}.`);
+                    return;
+                }
+                allPatches.push(before("actionHandler", actionHandler, handler));
             } catch (e) {
-                console.error(`[CustomVoiceMessages] Failed to patch ${funcName}:`, e);
+                console.error(`[CustomVoiceMessages] Failed to patch ${actionName}:`, e);
             }
         };
 
-        patchInstead("uploadLocalFiles");
-        patchInstead("CloudUpload");
-    }
-
-    // Patches message store actions to show existing audio as VMs
-    function patchMessageStore(action, name) {
-        try {
-            const handler = common.FluxDispatcher._actionHandlers._computeOrderedActionHandlers(action).find(e => e.name === name);
-            if (!handler) return;
-
-            patches.push(patcher.before("actionHandler", handler, (args) => {
-                if (!self.storage.allAsVM) return;
-                const message = (args[0].messages || [args[0].message])[0];
-                if (!message || message.flags === 8192) return;
-
-                const messages = args[0].messages || [args[0].message];
-                messages.forEach(msg => {
-                    if (msg?.attachments?.[0]?.content_type?.startsWith("audio")) {
+        patchAction("LOAD_MESSAGES_SUCCESS", (args) => {
+            if (!storage.allAsVM) return;
+            args[0].messages.forEach(msg => {
+                if (msg.flags === 8192) return;
+                msg.attachments.forEach(att => {
+                    if (att.content_type?.startsWith?.("audio")) {
                         msg.flags |= 8192;
-                        msg.attachments.forEach(att => {
-                            att.waveform = "AEtWPyUaGA4OEAcA"; // Static waveform for performance
-                            att.duration_secs = 60;
-                        });
+                        att.waveform = "AEtWPyUaGA4OEAcA";
+                        att.duration_secs = 60;
                     }
                 });
-            }));
-        } catch (e) {
-            console.error(`[CustomVoiceMessages] Failed to patch ${action}:`, e);
-        }
+            });
+        });
+
+        patchAction("MESSAGE_CREATE", (args) => {
+            if (!storage.allAsVM) return;
+            const message = args[0].message;
+            if (message.flags === 8192) return;
+            if (message?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                message.flags |= 8192;
+                message.attachments.forEach(x => {
+                    x.waveform = "AEtWPyUaGA4OEAcA";
+                    x.duration_secs = 60
+                });
+            }
+        });
+
+        patchAction("MESSAGE_UPDATE", (args) => {
+            if (!storage.allAsVM) return;
+            const message = args[0].message;
+            if (message.flags === 8192) return;
+            if (message?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                message.flags |= 8192;
+                message.attachments.forEach(x => {
+                    x.waveform = "AEtWPyUaGA4OEAcA";
+                    x.duration_secs = 60
+                });
+            }
+        });
     }
 
-    // Patches the long-press action sheet for messages
+    // From download.tsx
     function patchActionSheet() {
-        const ActionSheet = metro.findByProps("openLazy", "hideActionSheet");
-        if (!ActionSheet) return;
+        const ActionSheet = findByProps("openLazy", "hideActionSheet");
+        if (!ActionSheet) {
+            console.error("[CustomVoiceMessages] Could not find ActionSheet module.");
+            return;
+        }
 
-        patches.push(patcher.before("openLazy", ActionSheet, (args) => {
-            const [component, sheetName, props] = args;
-            if (sheetName !== "MessageLongPressActionSheet" || !props?.message) return;
+        allPatches.push(before("openLazy", ActionSheet, (ctx) => {
+            const [component, args, actionMessage] = ctx;
+            const message = actionMessage?.message;
+            if (args !== "MessageLongPressActionSheet" || !message) return;
 
             component.then(instance => {
-                const unpatch = patcher.after("default", instance, (_, res) => {
-                    common.React.useEffect(() => () => unpatch(), []);
-                    const buttonRow = utils.findInReactTree(res, r => r?.[0]?.type?.name === "ButtonRow");
-                    const message = props.message;
-                    if (!buttonRow || !message.hasFlag(8192)) return;
+                const unpatch = after("default", instance, (_, res) => {
+                    React.useEffect(() => () => unpatch(), []);
+                    const buttons = findInReactTree(res, (x) => x?.[0]?.type?.name === "ButtonRow");
+                    if (!buttons || !message.hasFlag(8192)) return;
 
-                    const ActionButton = metro.findByDisplayName("ActionSheetRow") ?? components.Forms.FormRow;
-                    const Icon = ActionButton.Icon ?? components.Forms.FormRow.Icon;
-
-                    const downloadButton = common.React.createElement(ActionButton, {
-                        label: "Download Voice Message",
-                        icon: common.React.createElement(Icon, {
-                            source: assets.getAssetIDByName("ic_download_24px")
-                        }),
-                        onPress: () => {
-                            metro.findByProps("downloadMediaAsset").downloadMediaAsset(message.attachments[0].url, 0);
-                            ActionSheet.hideActionSheet();
-                        }
-                    });
-
-                    const copyUrlButton = common.React.createElement(ActionButton, {
-                        label: "Copy Voice Message URL",
-                        icon: common.React.createElement(Icon, {
-                            source: assets.getAssetIDByName("copy")
-                        }),
-                        onPress: () => {
-                            common.clipboard.setString(message.attachments[0].url);
-                            ActionSheet.hideActionSheet();
-                        }
-                    });
-
-                    buttonRow.splice(5, 0, downloadButton, copyUrlButton);
+                    const downloadUtil = findByProps("downloadMediaAsset");
+                    
+                    buttons.splice(5, 0,
+                        React.createElement(CoolRow, {
+                            label: "Download Voice Message",
+                            icon: getAssetIDByName("ic_download_24px"),
+                            onPress: () => {
+                                downloadUtil.downloadMediaAsset(message.attachments[0].url, 0);
+                                ActionSheet.hideActionSheet();
+                            }
+                        })
+                    );
+                    buttons.splice(6, 0,
+                        React.createElement(CoolRow, {
+                            label: "Copy Voice Message URL",
+                            icon: getAssetIDByName("copy"),
+                            onPress: () => {
+                                clipboard.setString(message.attachments[0].url);
+                                ActionSheet.hideActionSheet();
+                            }
+                        })
+                    );
                 });
             });
         }));
     }
 
-    // --- Settings Component ---
-    const {
-        FormDivider,
-        FormIcon,
-        FormSwitchRow
-    } = components.Forms;
+    // --- 3. Settings UI (from settings.tsx) ---
+    function SettingsComponent() {
+        storage.useProxy(storage);
+        const {
+            FormDivider,
+            FormIcon,
+            FormSwitchRow
+        } = Forms;
 
-    function Settings() {
-        storage.useProxy(self.storage);
-        return common.React.createElement(common.ReactNative.View, null,
-            common.React.createElement(FormSwitchRow, {
-                label: "Send audio files as Voice Message",
-                leading: common.React.createElement(FormIcon, {
-                    source: assets.getAssetIDByName("voice_bar_mute_off")
+        return (
+            React.createElement(ReactNative.ScrollView, null,
+                React.createElement(FormSwitchRow, {
+                    label: "Send audio files as Voice Message",
+                    leading: React.createElement(FormIcon, {
+                        source: getAssetIDByName("voice_bar_mute_off")
+                    }),
+                    onValueChange: (v) => (storage.sendAsVM = v),
+                    value: storage.sendAsVM
                 }),
-                onValueChange: v => self.storage.sendAsVM = v,
-                value: self.storage.sendAsVM
-            }),
-            common.React.createElement(FormDivider, null),
-            common.React.createElement(FormSwitchRow, {
-                label: "Show every audio file as a Voice Message",
-                subLabel: "This uses a placeholder waveform for performance.",
-                leading: common.React.createElement(FormIcon, {
-                    source: assets.getAssetIDByName("ic_stage_music")
-                }),
-                onValueChange: v => self.storage.allAsVM = v,
-                value: self.storage.allAsVM
-            })
+                React.createElement(FormDivider, null),
+                React.createElement(FormSwitchRow, {
+                    label: "Show every audio file as a Voice Message",
+                    leading: React.createElement(FormIcon, {
+                        source: getAssetIDByName("ic_stage_music")
+                    }),
+                    onValueChange: (v) => (storage.allAsVM = v),
+                    value: storage.allAsVM
+                })
+            )
         );
     }
 
-    // --- Plugin Lifecycle ---
+    // --- 4. Plugin Lifecycle ---
     try {
-        self.storage.sendAsVM ??= true;
-        self.storage.allAsVM ??= false;
+        storage.sendAsVM ??= true;
+        storage.allAsVM ??= false;
 
         patchUploader();
+        patchMessageStore();
+        patchActionSheet();
+
+        plugin.onUnload = () => allPatches.forEach(p => p?.());
+        plugin.settings = SettingsComponent;
+
+    } catch (e) {
+        console.error("[CustomVoiceMessages] FATAL: Plugin failed to initialize.", e);
+    }
+
+})({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage); patchUploader();
         patchMessageStore("LOAD_MESSAGES_SUCCESS", "MessageStore");
         patchMessageStore("MESSAGE_CREATE", "MessageStore");
         patchMessageStore("MESSAGE_UPDATE", "MessageStore");
