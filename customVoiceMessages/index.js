@@ -1,141 +1,96 @@
 /**
- * CustomVoiceMessages (Gemini Build)
+ * Module Inspector
  *
- * This version is a complete rewrite based on modern patching techniques
- * discovered through research. It uses a single, stable patch point to
- * perform all necessary actions, which is the current best practice for
- * Discord client modding. This should be the definitive, working version.
+ * A diagnostic tool to safely inspect the modules of a modded Discord client.
+ * This plugin is designed to be un-crashable and is used for gathering
+ * information to build other, more complex plugins.
  *
- * Original Authors: Dziurwa, シグマ siguma
- * Rebuilt By: Gemini
+ * Built by Gemini to solve a complex debugging problem.
  */
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    // --- 1. Modules & Setup ---
     const { React, ReactNative } = common;
-    const { findByProps } = metro;
-    const { before } = patcher;
+    const { findByProps, findByStoreName, findAll } = metro;
     const { Forms } = components;
-    const { getAssetIDByName } = assets;
-    const { showToast } = ui.toasts;
 
-    let unpatch; // A variable to hold our unpatch function
-
-    // --- 2. The Real Waveform Generation Logic (Unchanged) ---
-    async function generateRealWaveform(file) {
+    // A safe way to get properties from an object, handling potential errors.
+    const getKeys = (obj) => {
+        if (!obj) return "Module is null or undefined";
         try {
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            if (!AudioContext) throw new Error("AudioContext not supported");
-            const arrayBuffer = await new Promise((res, rej) => {
-                const reader = new FileReader();
-                reader.onload = () => res(reader.result);
-                reader.onerror = (err) => rej(err);
-                reader.readAsArrayBuffer(file);
-            });
-            const audioCtx = new AudioContext();
-            const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-            const rawData = decoded.getChannelData(0);
-            const waveformPoints = 100;
-            const blockSize = Math.floor(rawData.length / waveformPoints);
-            const peaks = new Uint8Array(waveformPoints);
-            let maxPeak = 0;
-            for (let i = 0; i < waveformPoints; i++) {
-                let sum = 0;
-                for (let j = 0; j < blockSize; j++) {
-                    sum += Math.abs(rawData[i * blockSize + j]);
-                }
-                const avg = sum / blockSize;
-                if (avg > maxPeak) maxPeak = avg;
-                peaks[i] = avg;
-            }
-            if (maxPeak > 0) {
-                for (let i = 0; i < waveformPoints; i++) {
-                    peaks[i] = Math.floor((peaks[i] / maxPeak) * 63);
-                }
-            }
-            const waveformBase64 = btoa(String.fromCharCode.apply(null, peaks));
-            return { waveform: waveformBase64, duration: decoded.duration };
+            return Object.keys(obj).join(", ");
         } catch (e) {
-            console.error("[CVM] Waveform generation failed:", e);
-            return { waveform: "AEtWPyUaGA4OEAcA", duration: 60.0 };
+            return `Error getting keys: ${e.message}`;
         }
-    }
+    };
 
-    // --- 3. The New, Modern Patching Method ---
-    function applyModernPatch() {
-        // The new method targets the core Uploader module directly.
-        const Uploader = findByProps("upload");
-        if (!Uploader) {
-            console.error("[CVM] Critical Error: Could not find the core Uploader module.");
-            return;
-        }
+    // --- The Main Inspector UI ---
+    const InspectorComponent = () => {
+        const [results, setResults] = React.useState("Press a button to begin inspection...");
 
-        // We patch the 'upload' function itself. This gives us access to everything.
-        unpatch = before("upload", Uploader, (args) => {
-            const [channelId, upload, options] = args;
-            const fileItem = upload.items?.[0] ?? upload;
-            const shouldIntercept = storage.sendAsVM && fileItem?.mimeType?.startsWith("audio");
-
-            if (!shouldIntercept) return args; // If not our concern, continue without changes.
-
-            // This async IIFE (Immediately Invoked Function Expression) lets us use await
-            // without needing to make the whole patch async, which is safer.
-            (async () => {
-                try {
-                    showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
-                    
-                    // Generate our real waveform.
-                    const { waveform, duration } = await generateRealWaveform(fileItem);
-                    
-                    // Modify the file object *in place*.
-                    fileItem.mimeType = "audio/ogg";
-                    fileItem.waveform = waveform;
-                    fileItem.durationSecs = duration;
-                    
-                    // **THE SECRET**: Set the flag on the main upload object.
-                    upload.flags = 8192;
-
-                } catch (e) {
-                    console.error("[CVM] Failed to process audio file:", e);
-                    showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
+        const inspectModule = (title, finder) => {
+            let output = `--- ${title} ---\n`;
+            try {
+                const module = finder();
+                if (module) {
+                    output += `Module Found!\n`;
+                    output += `Properties: ${getKeys(module)}\n`;
+                    // For modules with prototypes (like CloudUpload)
+                    if (module.prototype) {
+                        output += `Prototype Properties: ${getKeys(module.prototype)}\n`;
+                    }
+                } else {
+                    output += `Module NOT Found.\n`;
                 }
-            })();
+            } catch (e) {
+                output += `An error occurred during inspection: ${e.message}\n`;
+            }
+            output += "\n";
+            setResults(prev => prev + output);
+        };
+        
+        const reset = () => {
+            setResults("Press a button to begin inspection...\n");
+        };
 
-            return args; // Return the (now modified) arguments to the original function.
-        });
-    }
+        const copyToClipboard = () => {
+            common.clipboard.setString(results);
+            ui.toasts.showToast("Results copied to clipboard!");
+        };
 
-    // --- 4. Settings UI ---
-    function SettingsComponent() {
-        storage.useProxy(storage);
-        return (
-            React.createElement(ReactNative.ScrollView, null,
-                React.createElement(Forms.FormSwitchRow, {
-                    label: "Send audio files as Voice Message",
-                    subLabel: "Converts audio uploads into voice messages with real waveforms.",
-                    leading: React.createElement(Forms.FormIcon, { source: getAssetIDByName("voice_bar_mute_off") }),
-                    onValueChange: (v) => (storage.sendAsVM = v),
-                    value: storage.sendAsVM
-                })
+        return React.createElement(ReactNative.View, { style: { flex: 1, backgroundColor: "#2f3136", padding: 10 } },
+            React.createElement(ReactNative.Text, { style: { color: "white", fontSize: 18, fontWeight: "bold", marginBottom: 10 } }, "Module Inspector"),
+            React.createElement(ReactNative.ScrollView, { style: { flex: 1, marginBottom: 10 } },
+                React.createElement(Forms.FormRow, { 
+                    label: "1. Inspect Core Uploader",
+                    subLabel: "Looks for the main 'upload' function.",
+                    onPress: () => inspectModule("Core Uploader (findByProps('upload'))", () => findByProps("upload"))
+                }),
+                React.createElement(Forms.FormRow, { 
+                    label: "2. Inspect File Uploader",
+                    subLabel: "Looks for 'uploadLocalFiles'.",
+                    onPress: () => inspectModule("File Uploader (findByProps('uploadLocalFiles'))", () => findByProps("uploadLocalFiles", "CloudUpload"))
+                }),
+                React.createElement(Forms.FormRow, { 
+                    label: "3. Inspect CloudUpload Module",
+                    subLabel: "Looks for the 'CloudUpload' class.",
+                    onPress: () => inspectModule("CloudUpload Module (findByProps('CloudUpload'))", () => findByProps("CloudUpload"))
+                }),
+            ),
+            React.createElement(ReactNative.Text, { style: { color: "#b9bbbe", fontSize: 14, marginBottom: 5 } }, "Results:"),
+            React.createElement(ReactNative.ScrollView, { style: { backgroundColor: "#202225", padding: 10, borderRadius: 5, flex: 2 } },
+                React.createElement(ReactNative.Text, { selectable: true, style: { color: "white", fontFamily: "monospace" } }, results)
+            ),
+             React.createElement(ReactNative.View, { style: { flexDirection: "row", justifyContent: "space-around", marginTop: 10 } },
+                React.createElement(Forms.FormButton, { title: "Copy Results", onPress: copyToClipboard, style: { flex: 1, marginRight: 5 } }),
+                React.createElement(Forms.FormButton, { title: "Clear", onPress: reset, style: { flex: 1, marginLeft: 5 }, color: "red" })
             )
         );
-    }
-
-    // --- 5. Plugin Lifecycle ---
-    plugin.onLoad = () => {
-        try {
-            storage.sendAsVM ??= true;
-            applyModernPatch();
-        } catch (e) {
-            console.error("[CVM] Failed to load plugin:", e);
-        }
     };
 
-    plugin.onUnload = () => {
-        unpatch?.();
-    };
-
-    plugin.settings = SettingsComponent;
+    // --- Plugin Lifecycle (designed to be un-crashable) ---
+    plugin.onLoad = () => {};
+    plugin.onUnload = () => {};
+    plugin.settings = InspectorComponent;
 
 })({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);
