@@ -2,39 +2,250 @@
  * CustomVoiceMessages - A Vendetta Plugin
  *
  * Original Author: Unknown
- * Fixed By: Gemini
+ * Fixed By: Gemini (Robust Version)
  *
  * This plugin allows sending audio files as if they were native voice messages
  * and optionally displays all audio files as voice messages.
  *
- * FIX:
- * - Replaced the static/fake waveform and duration with real, dynamically generated
- * values by processing the audio file before upload.
- * - Used the Web Audio API to decode the audio and generate a waveform that matches
- * the audio's amplitude.
- * - Patched the upload function asynchronously to allow for audio processing time.
+ * ROBUST VERSION:
+ * - Added extensive error checking to prevent the plugin from crashing on load.
+ * - Checks for the existence of modules and functions before patching.
+ * - Wraps audio processing in a try/catch block to handle decoding errors gracefully.
+ * - Simplified waveform generation for broader compatibility.
  */
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    /**
-     * Asynchronously generates audio metadata (duration and waveform) from a File object.
-     * @param {File} file The audio file to process.
-     * @returns {Promise<{duration: number, waveform: string}>} A promise that resolves with the audio's duration in seconds and a Base64 encoded waveform.
-     */
+    // --- Core Audio Processing ---
     const getAudioMetadata = (file) => {
-        if (!file) return Promise.reject("No file provided for audio metadata generation.");
+        // Check for Web Audio API support
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) {
+            console.error("[CustomVoiceMessages] Web Audio API not supported in this environment.");
+            return Promise.reject("AudioContext not supported.");
+        }
 
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
-
-            reader.onload = (event) => {
+            reader.onload = async (event) => {
                 const arrayBuffer = event.target.result;
-                // Use a global AudioContext for performance.
-                const audioContext = new(window.AudioContext || window.webkitAudioContext)();
+                if (!arrayBuffer) return reject("Failed to read file.");
 
-                audioContext.decodeAudioData(arrayBuffer)
-                    .then(buffer => {
+                try {
+                    const audioContext = new AudioContext();
+                    const buffer = await audioContext.decodeAudioData(arrayBuffer);
+
+                    const duration = buffer.duration;
+                    const channelData = buffer.getChannelData(0);
+                    const waveformPoints = 100;
+                    const samples = new Uint8Array(waveformPoints);
+                    const blockSize = Math.floor(channelData.length / waveformPoints);
+                    let maxAmp = 0;
+
+                    // Simplified amplitude calculation
+                    const amps = [];
+                    for (let i = 0; i < waveformPoints; i++) {
+                        const start = i * blockSize;
+                        let sum = 0;
+                        for (let j = 0; j < blockSize; j++) {
+                            sum += Math.abs(channelData[start + j]);
+                        }
+                        const amp = sum / blockSize;
+                        amps.push(amp);
+                        if (amp > maxAmp) maxAmp = amp;
+                    }
+
+                    // Normalize to 6-bit (0-63)
+                    if (maxAmp > 0) {
+                        for (let i = 0; i < waveformPoints; i++) {
+                            samples[i] = Math.floor((amps[i] / maxAmp) * 63);
+                        }
+                    }
+
+                    const waveform = btoa(String.fromCharCode.apply(null, samples));
+                    resolve({
+                        duration: Math.round(duration),
+                        waveform
+                    });
+                } catch (err) {
+                    console.error("[CustomVoiceMessages] Error decoding audio data:", err);
+                    reject(err);
+                }
+            };
+            reader.onerror = (error) => reject(error);
+            reader.readAsArrayBuffer(file);
+        });
+    };
+
+    // --- Patching Logic ---
+    const patches = [];
+
+    // Patches the file upload process
+    function patchUploader() {
+        const uploadModule = metro.findByProps("uploadLocalFiles", "CloudUpload");
+        if (!uploadModule) {
+            console.error("[CustomVoiceMessages] Could not find upload module.");
+            return;
+        }
+
+        const patchInstead = (funcName) => {
+            try {
+                patches.push(patcher.instead(funcName, uploadModule, async (args, originalFunc) => {
+                    const uploadData = args[0];
+                    if (!self.storage.sendAsVM || uploadData.flags === 8192) {
+                        return originalFunc.apply(this, args);
+                    }
+
+                    const item = uploadData.items?.[0] ?? uploadData;
+                    if (item?.file && item?.mimeType?.startsWith("audio")) {
+                        try {
+                            const {
+                                duration,
+                                waveform
+                            } = await getAudioMetadata(item.file);
+                            item.durationSecs = duration;
+                            item.waveform = waveform;
+                            item.mimeType = "audio/ogg";
+                            uploadData.flags = 8192;
+                        } catch (err) {
+                            console.error("[CustomVoiceMessages] Failed to process audio, sending as regular file.", err);
+                        }
+                    }
+                    return originalFunc.apply(this, args);
+                }));
+            } catch (e) {
+                console.error(`[CustomVoiceMessages] Failed to patch ${funcName}:`, e);
+            }
+        };
+
+        patchInstead("uploadLocalFiles");
+        patchInstead("CloudUpload");
+    }
+
+    // Patches message store actions to show existing audio as VMs
+    function patchMessageStore(action, name) {
+        try {
+            const handler = common.FluxDispatcher._actionHandlers._computeOrderedActionHandlers(action).find(e => e.name === name);
+            if (!handler) return;
+
+            patches.push(patcher.before("actionHandler", handler, (args) => {
+                if (!self.storage.allAsVM) return;
+                const message = (args[0].messages || [args[0].message])[0];
+                if (!message || message.flags === 8192) return;
+
+                const messages = args[0].messages || [args[0].message];
+                messages.forEach(msg => {
+                    if (msg?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                        msg.flags |= 8192;
+                        msg.attachments.forEach(att => {
+                            att.waveform = "AEtWPyUaGA4OEAcA"; // Static waveform for performance
+                            att.duration_secs = 60;
+                        });
+                    }
+                });
+            }));
+        } catch (e) {
+            console.error(`[CustomVoiceMessages] Failed to patch ${action}:`, e);
+        }
+    }
+
+    // Patches the long-press action sheet for messages
+    function patchActionSheet() {
+        const ActionSheet = metro.findByProps("openLazy", "hideActionSheet");
+        if (!ActionSheet) return;
+
+        patches.push(patcher.before("openLazy", ActionSheet, (args) => {
+            const [component, sheetName, props] = args;
+            if (sheetName !== "MessageLongPressActionSheet" || !props?.message) return;
+
+            component.then(instance => {
+                const unpatch = patcher.after("default", instance, (_, res) => {
+                    common.React.useEffect(() => () => unpatch(), []);
+                    const buttonRow = utils.findInReactTree(res, r => r?.[0]?.type?.name === "ButtonRow");
+                    const message = props.message;
+                    if (!buttonRow || !message.hasFlag(8192)) return;
+
+                    const ActionButton = metro.findByDisplayName("ActionSheetRow") ?? components.Forms.FormRow;
+                    const Icon = ActionButton.Icon ?? components.Forms.FormRow.Icon;
+
+                    const downloadButton = common.React.createElement(ActionButton, {
+                        label: "Download Voice Message",
+                        icon: common.React.createElement(Icon, {
+                            source: assets.getAssetIDByName("ic_download_24px")
+                        }),
+                        onPress: () => {
+                            metro.findByProps("downloadMediaAsset").downloadMediaAsset(message.attachments[0].url, 0);
+                            ActionSheet.hideActionSheet();
+                        }
+                    });
+
+                    const copyUrlButton = common.React.createElement(ActionButton, {
+                        label: "Copy Voice Message URL",
+                        icon: common.React.createElement(Icon, {
+                            source: assets.getAssetIDByName("copy")
+                        }),
+                        onPress: () => {
+                            common.clipboard.setString(message.attachments[0].url);
+                            ActionSheet.hideActionSheet();
+                        }
+                    });
+
+                    buttonRow.splice(5, 0, downloadButton, copyUrlButton);
+                });
+            });
+        }));
+    }
+
+    // --- Settings Component ---
+    const {
+        FormDivider,
+        FormIcon,
+        FormSwitchRow
+    } = components.Forms;
+
+    function Settings() {
+        storage.useProxy(self.storage);
+        return common.React.createElement(common.ReactNative.View, null,
+            common.React.createElement(FormSwitchRow, {
+                label: "Send audio files as Voice Message",
+                leading: common.React.createElement(FormIcon, {
+                    source: assets.getAssetIDByName("voice_bar_mute_off")
+                }),
+                onValueChange: v => self.storage.sendAsVM = v,
+                value: self.storage.sendAsVM
+            }),
+            common.React.createElement(FormDivider, null),
+            common.React.createElement(FormSwitchRow, {
+                label: "Show every audio file as a Voice Message",
+                subLabel: "This uses a placeholder waveform for performance.",
+                leading: common.React.createElement(FormIcon, {
+                    source: assets.getAssetIDByName("ic_stage_music")
+                }),
+                onValueChange: v => self.storage.allAsVM = v,
+                value: self.storage.allAsVM
+            })
+        );
+    }
+
+    // --- Plugin Lifecycle ---
+    try {
+        self.storage.sendAsVM ??= true;
+        self.storage.allAsVM ??= false;
+
+        patchUploader();
+        patchMessageStore("LOAD_MESSAGES_SUCCESS", "MessageStore");
+        patchMessageStore("MESSAGE_CREATE", "MessageStore");
+        patchMessageStore("MESSAGE_UPDATE", "MessageStore");
+        patchActionSheet();
+
+        plugin.onUnload = () => patches.forEach(p => p?.());
+        plugin.settings = Settings;
+    } catch (err) {
+        console.error("[CustomVoiceMessages] Failed to initialize plugin:", err);
+        // This catch block prevents the plugin from fully crashing and showing the [X]
+    }
+
+})({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);                    .then(buffer => {
                         const duration = buffer.duration;
                         const channelData = buffer.getChannelData(0); // Use the first channel
                         const waveformPoints = 100; // Generate 100 points for the waveform visual
