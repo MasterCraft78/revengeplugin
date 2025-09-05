@@ -1,53 +1,49 @@
 (function(f, s, c, a, o, l, _, v, h, p) {
     "use strict";
 
-    async function _fetchArrayBufferFromAttachment(attachment) {
-        if (!attachment?.uri && !attachment?.url) return null;
-        const response = await fetch(attachment.uri ?? attachment.url);
-        if (!response.ok) return null;
-        return await response.arrayBuffer();
-    }
-
-    async function _computeWaveformFromBuffer(buffer, samples = 64) {
-        try {
-            const audioContext = new(window.AudioContext || window.webkitAudioContext)();
-            const audioBuffer = await audioContext.decodeAudioData(buffer);
-            const rawData = audioBuffer.getChannelData(0);
-            const blockSize = Math.floor(rawData.length / samples);
-            if (blockSize === 0) return null;
-
-            const filteredData = [];
-            for (let i = 0; i < samples; i++) {
-                let blockStart = blockSize * i;
-                let sum = 0;
-                for (let j = 0; j < blockSize; j++) {
-                    sum += Math.abs(rawData[blockStart + j]);
-                }
-                filteredData.push(sum / blockSize);
-            }
-
-            const multiplier = Math.pow(Math.max(...filteredData), -1);
-            const normalizedData = filteredData.map(n => Math.min(255, Math.floor((n * multiplier) * 255)));
-            const waveformBytes = new Uint8Array(normalizedData);
-            const binString = Array.from(waveformBytes, byte => String.fromCodePoint(byte)).join("");
-            return btoa(binString);
-        } catch {
-            return null;
-        }
-    }
-
     function w(e) {
+        // --- Start of safe, contained logic ---
         try {
             if (!e?.mimeType?.startsWith("audio")) return;
+
+            // Helper functions are now defined INSIDE w(e) to avoid breaking the plugin.
+            async function _fetchArrayBufferFromAttachment(attachment) {
+                if (!attachment?.uri && !attachment?.url) return null;
+                const response = await fetch(attachment.uri ?? attachment.url);
+                if (!response.ok) return null;
+                return await response.arrayBuffer();
+            }
+
+            async function _computeWaveformFromBuffer(buffer, samples = 64) {
+                try {
+                    const audioContext = new(window.AudioContext || window.webkitAudioContext)();
+                    const audioBuffer = await audioContext.decodeAudioData(buffer);
+                    const rawData = audioBuffer.getChannelData(0);
+                    const blockSize = Math.floor(rawData.length / samples);
+                    if (blockSize === 0) return null;
+                    const filteredData = [];
+                    for (let i = 0; i < samples; i++) {
+                        let blockStart = blockSize * i;
+                        let sum = 0;
+                        for (let j = 0; j < blockSize; j++) sum += Math.abs(rawData[blockStart + j]);
+                        filteredData.push(sum / blockSize);
+                    }
+                    const multiplier = Math.pow(Math.max(...filteredData), -1);
+                    const normalizedData = filteredData.map(n => Math.min(255, Math.floor((n * multiplier) * 255)));
+                    const waveformBytes = new Uint8Array(normalizedData);
+                    const binString = Array.from(waveformBytes, byte => String.fromCodePoint(byte)).join("");
+                    return btoa(binString);
+                } catch {
+                    return null;
+                }
+            }
 
             e.mimeType = "audio/ogg";
             e.durationSecs = e.durationSecs ?? e.duration_secs ?? 60;
             e.duration_secs = e.duration_secs ?? e.durationSecs ?? 60;
 
-            // always give a placeholder waveform so Discord won’t crash
             if (!e.waveform) e.waveform = "AEtWPyUaGA4OEAcA";
 
-            // compute real waveform later without blocking RN render
             setTimeout(async () => {
                 try {
                     const buf = await _fetchArrayBufferFromAttachment(e);
@@ -57,7 +53,9 @@
                 } catch {}
             }, 0);
         } catch {}
+        // --- End of safe, contained logic ---
     }
+
 
     function P() {
         const e = [],
