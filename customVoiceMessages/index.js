@@ -1,14 +1,19 @@
 (function(f, s, c, a, o, l, _, v, h, p) {
     "use strict";
 
+    // --- UTILITIES & CORE LOGIC ---
+
+    // This is our audio analysis function from before. It takes a file,
+    // processes it, and returns the real waveform and duration.
     async function generateWaveformData(file) {
         try {
             const audioContext = new(window.AudioContext || window.webkitAudioContext)();
             const arrayBuffer = await file.arrayBuffer();
             const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
             const durationSecs = Math.round(audioBuffer.duration);
+
             const rawData = audioBuffer.getChannelData(0);
-            const samples = 128;
+            const samples = 128; // Number of bars for the waveform
             const blockSize = Math.floor(rawData.length / samples);
             const filteredData = [];
             for (let i = 0; i < samples; i++) {
@@ -19,53 +24,121 @@
                 }
                 filteredData.push(sum / blockSize);
             }
+
             const multiplier = Math.pow(Math.max(...filteredData), -1);
             const normalizedData = filteredData.map(n => Math.min(255, Math.floor((n * multiplier) * 255)));
             const waveformBytes = new Uint8Array(normalizedData);
             const binString = Array.from(waveformBytes, byte => String.fromCodePoint(byte)).join("");
             const waveform = btoa(binString);
+
             return {
                 waveform,
                 durationSecs
             };
         } catch (err) {
             console.error("Failed to process audio file:", err);
+            // Use a toast to show the user something went wrong
+            s.findByProps("showToast")?.showToast?.("Failed to process audio file. It may be corrupted.", l.getAssetIDByName("Small"));
             return null;
         }
     }
 
-    function P() {
-        const e = [],
-            t = function(n) {
-                try {
-                    const u = s.findByProps(n);
-                    const r = c.instead(n, u, async function(args, originalFunc) {
-                        const uploadData = args[0];
-                        if (!a.storage.sendAsVM || uploadData.flags === 8192) {
-                            return originalFunc.apply(this, args);
-                        }
-                        const item = uploadData.items?.[0] ?? uploadData;
-                        if (item?.mimeType?.startsWith("audio") && item.file) {
-                            const audioData = await generateWaveformData(item.file);
-                            if (audioData) {
-                                item.waveform = audioData.waveform;
-                                item.durationSecs = audioData.durationSecs;
-                                uploadData.flags = 8192;
-                                item.mimeType = "audio/ogg";
-                            }
-                        }
-                        return originalFunc.apply(this, args);
-                    });
-                    e.push(r);
-                } catch {}
-            };
-        t("uploadLocalFiles");
-        t("CloudUpload");
-        return function() {
-            e.forEach(n => n());
+    // --- MODULES (finding Discord's internal code) ---
+    const Toasts = s.findByProps("showToast");
+    const {
+        pickSingle
+    } = s.findByProps("pickSingle");
+    const {
+        uploadLocalFiles
+    } = s.findByProps("uploadLocalFiles");
+    const ChannelStore = s.findByProps("getChannel", "hasChannel");
+    const ChatInput = s.findByName("ChatInput");
+
+
+    // --- NEW CUSTOM UPLOAD BUTTON COMPONENT ---
+    function CustomVoiceUploadButton() {
+        const onPress = async () => {
+            try {
+                // 1. Open the native file picker
+                const result = await pickSingle({
+                    type: "audio/*"
+                });
+                if (!result) return;
+
+                const file = {
+                    uri: result.uri,
+                    name: result.name,
+                    type: result.type,
+                    size: result.size,
+                };
+
+                // 2. Show a "processing" toast to the user
+                Toasts.showToast("Processing audio...", l.getAssetIDByName("toast_image_processing"));
+
+                // 3. Generate the real waveform and duration
+                const audioData = await generateWaveformData(file);
+                if (!audioData) return; // Error was already handled inside
+
+                // 4. Get the current channel ID
+                const channelId = ChannelStore.getChannelId();
+                if (!channelId) return;
+
+                // 5. Prepare and send the file using Discord's uploader
+                uploadLocalFiles({
+                    channelId: channelId,
+                    uploads: [{
+                        file: file,
+                        isRemix: false,
+                        showLargeMessageDialog: true,
+                    }, ],
+                    // This is where we inject our processed data
+                    draftType: 0,
+                    flags: 8192, // The flag that makes it a "voice message"
+                    waveform: audioData.waveform,
+                    durationSecs: audioData.durationSecs,
+                });
+
+            } catch (err) {
+                if (err.message.includes("cancelled")) {
+                    return; // User cancelled file picking, do nothing.
+                }
+                console.error("Custom voice upload failed:", err);
+                Toasts.showToast("Failed to upload file.", l.getAssetIDByName("Small"));
+            }
         };
+
+        // This is the actual button component that gets added to the chat bar
+        return o.React.createElement(o.ReactNative.TouchableOpacity, {
+            onPress: onPress,
+            style: {
+                paddingHorizontal: 10,
+                justifyContent: "center"
+            },
+            children: [o.React.createElement(o.ReactNative.Image, {
+                source: l.getAssetIDByName("ic_mic_24px"),
+                style: {
+                    width: 24,
+                    height: 24,
+                    tintColor: v.semanticColors.INTERACTIVE_NORMAL
+                }
+            })]
+        });
     }
 
+    // --- PATCH TO ADD THE BUTTON ---
+    function AddButtonPatch() {
+        // We find the ChatInput component and add our button next to the existing ones.
+        return c.after("render", ChatInput.prototype, (_, res) => {
+            const actionButtons = _.findInReactTree(res, r => r.key === "action-buttons");
+            if (actionButtons?.props?.children) {
+                actionButtons.props.children.unshift(o.React.createElement(CustomVoiceUploadButton));
+            }
+            return res;
+        });
+    }
+
+
+    // --- Old functions for viewing existing messages as voice notes (can stay) ---
     function V() {
         return c.before("actionHandler", o.FluxDispatcher._actionHandlers._computeOrderedActionHandlers("LOAD_MESSAGES_SUCCESS").find(function(e) {
             return e.name === "MessageStore"
@@ -117,12 +190,12 @@
                 tintColor: v.semanticColors.INTERACTIVE_NORMAL
             }
         });
-        return d ? React.createElement(d, {
+        return d ? o.React.createElement(d, {
             label: e,
-            icon: React.createElement(d.Icon, {
+            icon: o.React.createElement(d.Icon, {
                 source: t,
                 IconComponent: function() {
-                    return React.createElement(o.ReactNative.Image, {
+                    return o.React.createElement(o.ReactNative.Image, {
                         resizeMode: "cover",
                         style: u.iconComponent,
                         source: t
@@ -132,9 +205,9 @@
             onPress: function() {
                 return n?.()
             }
-        }) : React.createElement(E, {
+        }) : o.React.createElement(E, {
             label: e,
-            leading: React.createElement(E.Icon, {
+            leading: o.React.createElement(E.Icon, {
                 source: t
             }),
             onPress: function() {
@@ -182,18 +255,18 @@
     } = h.Forms;
 
     function F() {
-        return p.useProxy(a.storage), React.createElement(o.ReactNative.ScrollView, null, React.createElement(R, {
+        return p.useProxy(a.storage), o.React.createElement(o.ReactNative.ScrollView, null, o.React.createElement(R, {
             label: "Send audio files as Voice Message",
-            leading: React.createElement(S, {
+            leading: o.React.createElement(S, {
                 source: l.getAssetIDByName("voice_bar_mute_off")
             }),
             onValueChange: function(e) {
                 return a.storage.sendAsVM = e
             },
             value: a.storage.sendAsVM
-        }), React.createElement(D, null), React.createElement(R, {
+        }), o.React.createElement(D, null), o.React.createElement(R, {
             label: "Show every audio file as a Voice Message",
-            leading: React.createElement(S, {
+            leading: o.React.createElement(S, {
                 source: l.getAssetIDByName("ic_stage_music")
             }),
             onValueChange: function(e) {
@@ -203,7 +276,9 @@
         }))
     }
     a.storage.sendAsVM ??= !0, a.storage.allAsVM ??= !1;
-    const U = [P(), b(), V(), C(), B()],
+
+    // --- PLUGIN STARTUP AND SHUTDOWN ---
+    const U = [AddButtonPatch(), b(), V(), C(), B()],
         H = function() {
             U.forEach(function(e) {
                 return e()
@@ -213,4 +288,3 @@
 })({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);
 
 
-                            
