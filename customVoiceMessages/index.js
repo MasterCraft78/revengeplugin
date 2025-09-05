@@ -1,261 +1,277 @@
-// --- Imports ---
-import { findByProps } from "@vendetta/metro";
-import { before, after } from "@vendetta/patcher";
-import { storage } from "@vendetta/plugin";
-import { React, ReactNative as RN, stylesheet, FluxDispatcher, clipboard } from "@vendetta/metro/common";
-import { getAssetIDByName } from "@vendetta/ui/assets";
-import { findInReactTree } from "@vendetta/utils";
-import { semanticColors } from "@vendetta/ui";
-import { showToast } from "@vendetta/ui/toasts";
+/**
+ * This plugin provides two main features for handling audio files:
+ * 1. Sending audio files as if they were native voice messages.
+ * 2. Displaying all audio files in chat as voice messages.
+ * It also adds "Download" and "Copy URL" options to the long-press menu for voice messages.
+ */
+(function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
+    "use strict";
 
-// --- Modern UI Components (from the working plugin) ---
-const { ScrollView } = findByProps("ScrollView");
-const { TableRowGroup, TableSwitchRow } = findByProps("TableSwitchRow", "TableRowGroup");
-const ActionSheet = findByProps("openLazy", "hideActionSheet");
-const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
-const { FormRow } = findByProps("FormRow"); // Fallback for CoolRow
+    const {
+        React,
+        FluxDispatcher,
+        clipboard,
+        ReactNative,
+        stylesheet
+    } = common;
+    const {
+        findInReactTree
+    } = utils;
+    const {
+        Forms
+    } = components;
+    const {
+        semanticColors
+    } = ui;
 
-// --- State and Utilities ---
-
-// Generates a real waveform from audio data to make it look authentic
-async function generateWaveform(file: any): Promise<{ waveform: string, duration: number }> {
-    try {
-        // The file object from the uploader is not a standard File object.
-        // We assume it has a `uri` property that points to the local file.
-        const response = await fetch(file.uri);
-        const arrayBuffer = await response.arrayBuffer();
-
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-
-        const rawData = decoded.getChannelData(0);
-        const blockSize = Math.floor(rawData.length / 100); // 100 bars for the waveform
-        const peaks = [];
-
-        for (let i = 0; i < 100; i++) {
-            let sum = 0;
-            for (let j = 0; j < blockSize; j++) {
-                sum += Math.abs(rawData[i * blockSize + j]);
-            }
-            peaks.push(sum / blockSize);
+    /**
+     * Modifies an audio file object to appear as a voice message.
+     * @param {object} audioFile - The file object to modify.
+     */
+    function processAudioFile(audioFile) {
+        if (audioFile?.mimeType?.startsWith("audio")) {
+            audioFile.mimeType = "audio/ogg";
+            // A static waveform value to make it look like a voice message.
+            audioFile.waveform = "AEtWPyUaGA4OEAcA";
+            audioFile.durationSecs = 60; // A default duration.
         }
-
-        // Convert peak data to a Base64 string that Discord understands
-        const waveformBytes = new Uint8Array(peaks.map(p => Math.min(255, Math.floor(p * 255 * 1.5))));
-        const waveformBase64 = btoa(String.fromCharCode.apply(null, waveformBytes));
-
-        return { waveform: waveformBase64, duration: decoded.duration };
-    } catch (e) {
-        console.error("[VoiceMessages] Waveform generation failed:", e);
-        showToast("Couldn't generate waveform, using fallback.");
-        // Fallback dummy waveform if generation fails
-        return { waveform: "AEtWPyUaGA4OEAcA", duration: 60.0 };
     }
-}
 
-// --- Components ---
-
-// A nice-looking row for the action sheet (long-press menu)
-const CoolRow = ({ label, icon, onPress }: { label: string; icon: number; onPress?: () => void; }) => {
-    const styles = stylesheet.createThemedStyleSheet({
-        iconComponent: {
-            width: 24,
-            height: 24,
-            tintColor: semanticColors.INTERACTIVE_NORMAL,
-        },
-    });
-
-    return ActionSheetRow ? (
-        <ActionSheetRow
-            label={label}
-            icon={
-                <ActionSheetRow.Icon
-                    source={icon}
-                    IconComponent={() => <RN.Image resizeMode="cover" style={styles.iconComponent} source={icon} />}
-                />
-            }
-            onPress={onPress}
-        />
-    ) : (
-        <FormRow
-            label={label}
-            leading={<FormRow.Icon source={icon} />}
-            onPress={onPress}
-        />
-    );
-};
-
-// --- Patches ---
-
-// This is the new, modern way to patch the uploader
-function patchUploader() {
-    const CloudUpload = findByProps("CloudUpload")?.CloudUpload;
-    if (!CloudUpload?.prototype?.reactNativeCompressAndExtractData) {
-        console.error("[VoiceMessages] Could not find the method to patch the uploader!");
-        showToast("❌ VoiceMessages failed to patch the uploader.", getAssetIDByName("Small"));
-        return () => {};
-    }
-    const originalUpload = CloudUpload.prototype.reactNativeCompressAndExtractData;
-
-    CloudUpload.prototype.reactNativeCompressAndExtractData = async function (...args) {
-        // 'this' refers to the file being uploaded
-        if (storage.sendAsVM && this?.mimeType?.startsWith("audio")) {
+    /**
+     * Patches file upload functions to intercept audio files.
+     * @returns {function} A function to remove the patches.
+     */
+    function patchUploads() {
+        const patches = [];
+        const createPatch = (funcName) => {
             try {
-                // Modify the file object before it gets uploaded
-                const result = await generateWaveform(this);
-                this.mimeType = "audio/ogg"; // Discord expects ogg for voice messages
-                this.waveform = result.waveform;
-                this.durationSecs = result.duration;
+                const uploadModule = metro.findByProps(funcName);
+                const unpatch = patcher.before(funcName, uploadModule, (args) => {
+                    const uploadData = args[0];
+                    if (!self.storage.sendAsVM || uploadData.flags === 8192) return;
+
+                    const item = uploadData.items?.[0] ?? uploadData;
+                    if (item?.mimeType?.startsWith("audio")) {
+                        processAudioFile(item);
+                        uploadData.flags = 8192; // Flag for voice message
+                    }
+                });
+                patches.push(unpatch);
             } catch (e) {
-                console.error("[VoiceMessages] Failed to transform audio file:", e);
+                console.error(`Failed to patch ${funcName}:`, e);
             }
-        }
-        // Let the original Discord function run with our modified file object
-        return originalUpload.apply(this, args);
-    };
+        };
 
-    return () => { // Return the unpatch function
-        CloudUpload.prototype.reactNativeCompressAndExtractData = originalUpload;
-    };
-}
+        createPatch("uploadLocalFiles");
+        createPatch("CloudUpload");
 
-// Patches for making existing audio files look like voice messages
-function patchMessageStore() {
-    const unpatches = [];
-    const MessageStore = findByProps("getMessage", "getMessages");
+        // Return a function that can be called to undo all patches.
+        return () => patches.forEach(p => p());
+    }
 
-    // When loading old messages
-    unpatches.push(before("dispatch", MessageStore, (args) => {
-        if (!storage.allAsVM) return;
-        const [event] = args;
-        if (event.type !== "LOAD_MESSAGES_SUCCESS") return;
-
-        event.messages.forEach(msg => {
-            if (msg.attachments?.[0]?.content_type?.startsWith("audio")) {
-                msg.flags |= 8192; // Add the voice message flag
-                msg.attachments.forEach(a => {
-                    a.waveform = "AEtWPyUaGA4OEAcA"; // Dummy waveform
-                    a.duration_secs = 60;
+    /**
+     * Patches the action handler for when a batch of messages is loaded.
+     * This makes existing audio files appear as voice messages.
+     * @returns {function} A function to remove the patch.
+     */
+    function patchLoadMessages() {
+        return patcher.before("actionHandler", FluxDispatcher._actionHandlers._computeOrderedActionHandlers("LOAD_MESSAGES_SUCCESS").find(h => h.name === "MessageStore"), (args) => {
+            if (self.storage.allAsVM) {
+                args[0].messages.forEach(message => {
+                    if (message.flags !== 8192) {
+                        message.attachments.forEach(attachment => {
+                            if (attachment.content_type?.startsWith?.("audio")) {
+                                message.flags |= 8192; // Add voice message flag
+                                attachment.waveform = "AEtWPyUaGA4OEAcA";
+                                attachment.duration_secs = 60;
+                            }
+                        });
+                    }
                 });
             }
         });
-    }));
+    }
 
-    // For new messages coming in
-    unpatches.push(before("dispatch", MessageStore, (args) => {
-        if (!storage.allAsVM) return;
-        const [event] = args;
-        if (event.type !== "MESSAGE_CREATE" && event.type !== "MESSAGE_UPDATE") return;
+    /**
+     * Patches the action handler for when a new message is created.
+     * @returns {function} A function to remove the patch.
+     */
+    function patchMessageCreate() {
+        return patcher.before("actionHandler", FluxDispatcher._actionHandlers._computeOrderedActionHandlers("MESSAGE_CREATE").find(h => h.name === "MessageStore"), (args) => {
+            if (!self.storage.allAsVM || args[0].message.flags === 8192) return;
 
-        const msg = event.message;
-        if (msg?.attachments?.[0]?.content_type?.startsWith("audio")) {
-            msg.flags |= 8192;
-            msg.attachments.forEach(a => {
-                a.waveform = "AEtWPyUaGA4OEAcA";
-                a.duration_secs = 60;
+            let message = args[0].message;
+            if (message?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                message.flags |= 8192;
+                message.attachments.forEach(att => {
+                    att.waveform = "AEtWPyUaGA4OEAcA";
+                    att.duration_secs = 60;
+                });
+            }
+        });
+    }
+
+    /**
+     * Patches the action handler for when a message is updated.
+     * @returns {function} A function to remove the patch.
+     */
+    function patchMessageUpdate() {
+        return patcher.before("actionHandler", FluxDispatcher._actionHandlers._computeOrderedActionHandlers("MESSAGE_UPDATE").find(h => h.name === "MessageStore"), (args) => {
+            if (!self.storage.allAsVM || args[0].message.flags === 8192) return;
+
+            let message = args[0].message;
+            if (message?.attachments?.[0]?.content_type?.startsWith("audio")) {
+                message.flags |= 8192;
+                message.attachments.forEach(att => {
+                    att.waveform = "AEtWPyUaGA4OEAcA";
+                    att.duration_secs = 60;
+                });
+            }
+        });
+    }
+
+
+    const ActionSheetRowModule = metro.findByProps("ActionSheetRow");
+    const ActionSheetRow = ActionSheetRowModule?.ActionSheetRow;
+
+    /**
+     * A custom React component for an action sheet button.
+     */
+    function ActionSheetButton({ label, icon, onPress }) {
+        const styles = stylesheet.createThemedStyleSheet({
+            iconComponent: {
+                width: 24,
+                height: 24,
+                tintColor: semanticColors.INTERACTIVE_NORMAL,
+            },
+        });
+
+        // Use ActionSheetRow if available, otherwise fallback to FormRow
+        if (ActionSheetRow) {
+            return React.createElement(ActionSheetRow, {
+                label: label,
+                icon: React.createElement(ActionSheetRow.Icon, {
+                    source: icon,
+                    IconComponent: () => React.createElement(ReactNative.Image, {
+                        resizeMode: "cover",
+                        style: styles.iconComponent,
+                        source: icon
+                    })
+                }),
+                onPress: () => onPress?.()
             });
         }
-    }));
 
-    return () => unpatches.forEach(p => p());
-}
+        return React.createElement(Forms.FormRow, {
+            label: label,
+            leading: React.createElement(Forms.FormRow.Icon, { source: icon }),
+            onPress: () => onPress?.()
+        });
+    }
 
-// Adds "Download" and "Copy URL" to the long-press menu for voice messages
-function patchDownloadMenu() {
-    return before("openLazy", ActionSheet, (ctx) => {
-        const [component, args, actionMessage] = ctx;
-        if (args !== "MessageLongPressActionSheet") return;
+    const ActionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
 
-        const message = actionMessage?.message;
-        if (!message?.attachments?.[0] || !(message.flags & 8192)) return;
+    /**
+     * Patches the long-press menu for messages to add custom options for voice messages.
+     * @returns {function} A function to remove the patch.
+     */
+    function patchMessageLongPressActionSheet() {
+        return patcher.before("openLazy", ActionSheetModule, (args) => {
+            const [componentPromise, sheetName, props] = args;
+            const message = props?.message;
 
-        component.then(instance => {
-            const unpatch = after("default", instance, (_, res) => {
-                React.useEffect(() => () => { unpatch() }, []);
-                const buttons = findInReactTree(res, (x) => x?.[0]?.type?.name === "ButtonRow");
-                if (!buttons) return;
+            if (sheetName !== "MessageLongPressActionSheet" || !message) return;
 
-                const attachment = message.attachments[0];
-                const url = attachment.url;
+            componentPromise.then(component => {
+                const unpatch = patcher.after("default", component, (ctx, res) => {
+                    // Unpatch automatically when the component unmounts
+                    React.useEffect(() => () => unpatch(), []);
 
-                buttons.splice(5, 0,
-                    <CoolRow
-                        label="Download Voice Message"
-                        icon={getAssetIDByName("ic_download_24px")}
-                        onPress={() => {
-                            findByProps("downloadMediaAsset").downloadMediaAsset(url, 0);
-                            ActionSheet.hideActionSheet();
-                        }}
-                    />,
-                    <CoolRow
-                        label="Copy Voice Message URL"
-                        icon={getAssetIDByName("copy")}
-                        onPress={() => {
-                            clipboard.setString(url);
-                            showToast("Copied URL to clipboard.", getAssetIDByName("toast_copy_link"));
-                            ActionSheet.hideActionSheet();
-                        }}
-                    />
-                );
+                    const buttonRow = findInReactTree(res, node => node?.[0]?.type?.name === "ButtonRow");
+                    if (!buttonRow) return res;
+                    
+                    // Check if the message is a voice message (flag 8192)
+                    if (message.hasFlag(8192)) {
+                        const mediaModule = metro.findByProps("downloadMediaAsset");
+
+                        // Add "Download Voice Message" button
+                        buttonRow.splice(5, 0, React.createElement(ActionSheetButton, {
+                            label: "Download Voice Message",
+                            icon: assets.getAssetIDByName("ic_download_24px"),
+                            onPress: async () => {
+                                await mediaModule.downloadMediaAsset(message.attachments[0].url, 0);
+                                ActionSheetModule.hideActionSheet();
+                            }
+                        }));
+
+                        // Add "Copy Voice Message URL" button
+                        buttonRow.splice(6, 0, React.createElement(ActionSheetButton, {
+                            label: "Copy Voice Message URL",
+                            icon: assets.getAssetIDByName("copy"),
+                            onPress: async () => {
+                                clipboard.setString(message.attachments[0].url);
+                                ActionSheetModule.hideActionSheet();
+                            }
+                        }));
+                    }
+                });
             });
         });
-    });
-}
+    }
 
-// --- Plugin Definition ---
+    /**
+     * The settings component for this plugin.
+     */
+    function SettingsComponent() {
+        storage.useProxy(self.storage);
 
-let patches: (() => void)[] = [];
-
-export default {
-    onLoad() {
-        // Set default settings if they don't exist
-        storage.sendAsVM ??= true;
-        storage.allAsVM ??= false;
-
-        // Apply all our patches
-        patches.push(patchUploader());
-        patches.push(patchMessageStore());
-        patches.push(patchDownloadMenu());
-    },
-
-    onUnload() {
-        // Unpatch everything when the plugin is stopped
-        patches.forEach(p => p());
-        patches = [];
-    },
-
-    settings: () => {
-        // Re-render component when storage changes
-        const [_, forceUpdate] = React.useReducer(x => ~x, 0);
-
-        return (
-            <ScrollView style={{ flex: 1 }}>
-                <RN.View style={{ padding: 10 }}>
-                    <TableRowGroup title="Upload Settings">
-                        <TableSwitchRow
-                            label="Send audio files as Voice Messages"
-                            subLabel="When enabled, any audio file you upload will become a voice message."
-                            value={storage.sendAsVM}
-                            onValueChange={(value) => {
-                                storage.sendAsVM = value;
-                                forceUpdate();
-                            }}
-                        />
-                    </TableRowGroup>
-                    <TableRowGroup title="Display Settings">
-                        <TableSwitchRow
-                            label="Show all audio files as Voice Messages"
-                            subLabel="Visually treats all audio files in chat as voice messages, even old ones."
-                            value={storage.allAsVM}
-                            onValueChange={(value) => {
-                                storage.allAsVM = value;
-                                forceUpdate();
-                            }}
-                        />
-                    </TableRowGroup>
-                </RN.View>
-            </ScrollView>
+        return React.createElement(ReactNative.ScrollView, null,
+            React.createElement(Forms.FormSwitchRow, {
+                label: "Send audio files as Voice Message",
+                leading: React.createElement(Forms.FormIcon, { source: assets.getAssetIDByName("voice_bar_mute_off") }),
+                onValueChange: (value) => self.storage.sendAsVM = value,
+                value: self.storage.sendAsVM
+            }),
+            React.createElement(Forms.FormDivider, null),
+            React.createElement(Forms.FormSwitchRow, {
+                label: "Show every audio file as a Voice Message",
+                leading: React.createElement(Forms.FormIcon, { source: assets.getAssetIDByName("ic_stage_music") }),
+                onValueChange: (value) => self.storage.allAsVM = value,
+                value: self.storage.allAsVM
+            })
         );
     }
-};
-                                    
+
+    // --- Plugin Initialization ---
+
+    // Set default settings if they don't exist
+    self.storage.sendAsVM ??= true;
+    self.storage.allAsVM ??= false;
+
+    // Apply all patches and store the unpatch functions
+    const unpatchers = [
+        patchUploads(),
+        patchMessageCreate(),
+        patchLoadMessages(),
+        patchMessageUpdate(),
+        patchMessageLongPressActionSheet(),
+    ];
+
+    // Define the cleanup function that will be called when the plugin is unloaded
+    plugin.onUnload = () => unpatchers.forEach(unpatch => unpatch());
+
+    // Register the settings component
+    plugin.settings = SettingsComponent;
+
+})(
+    {}, // plugin exports
+    vendetta.metro,
+    vendetta.patcher,
+    vendetta.plugin,
+    vendetta.metro.common,
+    vendetta.ui.assets,
+    vendetta.utils,
+    vendetta.ui,
+    vendetta.ui.components,
+    vendetta.storage
+);
