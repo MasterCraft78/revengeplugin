@@ -1,96 +1,102 @@
 /**
- * Module Inspector
+ * Slash Command Inspector
  *
- * A diagnostic tool to safely inspect the modules of a modded Discord client.
- * This plugin is designed to be un-crashable and is used for gathering
- * information to build other, more complex plugins.
+ * A diagnostic tool that uses a slash command (/inspect) to gather information,
+ * avoiding the need for a settings page UI which may be unreliable on some clients.
+ * This is the definitive, non-UI method for debugging.
  *
- * Built by Gemini to solve a complex debugging problem.
+ * Built by Gemini to solve a complex compatibility issue.
  */
-(function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
+(function(plugin, metro, patcher, commands, toasts, common, assets, utils, ui, storage, React, ConfirmationAlert, DCDChat) {
     "use strict";
 
-    const { React, ReactNative } = common;
-    const { findByProps, findByStoreName, findAll } = metro;
-    const { Forms } = components;
+    // --- 1. Modules & Setup ---
+    const { findByProps } = metro;
+    let unregister; // To hold the command unregister function
 
+    // --- 2. The Core Inspection Logic ---
     // A safe way to get properties from an object, handling potential errors.
-    const getKeys = (obj) => {
-        if (!obj) return "Module is null or undefined";
+    const getKeys = (obj, name = "Module") => {
+        if (obj === undefined || obj === null) return `- ${name}: NOT FOUND or is null/undefined.`;
         try {
-            return Object.keys(obj).join(", ");
+            const keys = Object.keys(obj);
+            let output = `- ${name} [FOUND]:\n  - Properties: ${keys.join(", ") || "[None]"}`;
+            if (obj.prototype) {
+                const protoKeys = Object.keys(obj.prototype);
+                output += `\n  - Prototype Properties: ${protoKeys.join(", ") || "[None]"}`;
+            }
+            return output;
         } catch (e) {
-            return `Error getting keys: ${e.message}`;
+            return `- ${name}: Error getting keys: ${e.message}`;
         }
     };
 
-    // --- The Main Inspector UI ---
-    const InspectorComponent = () => {
-        const [results, setResults] = React.useState("Press a button to begin inspection...");
-
-        const inspectModule = (title, finder) => {
-            let output = `--- ${title} ---\n`;
-            try {
-                const module = finder();
-                if (module) {
-                    output += `Module Found!\n`;
-                    output += `Properties: ${getKeys(module)}\n`;
-                    // For modules with prototypes (like CloudUpload)
-                    if (module.prototype) {
-                        output += `Prototype Properties: ${getKeys(module.prototype)}\n`;
-                    }
-                } else {
-                    output += `Module NOT Found.\n`;
-                }
-            } catch (e) {
-                output += `An error occurred during inspection: ${e.message}\n`;
-            }
-            output += "\n";
-            setResults(prev => prev + output);
-        };
+    const runInspection = () => {
+        let results = "--- Module Inspection Results ---\n\n";
         
-        const reset = () => {
-            setResults("Press a button to begin inspection...\n");
-        };
+        // Test 1: Core Uploader (Modern Method)
+        results += getKeys(findByProps("upload"), "Core Uploader (findByProps('upload'))") + "\n\n";
+        
+        // Test 2: File Uploader (Original CVM Method)
+        results += getKeys(findByProps("uploadLocalFiles", "CloudUpload"), "File Uploader (findByProps('uploadLocalFiles', 'CloudUpload'))") + "\n\n";
 
-        const copyToClipboard = () => {
-            common.clipboard.setString(results);
-            ui.toasts.showToast("Results copied to clipboard!");
-        };
+        // Test 3: CloudUpload Class (catbox.moe Method)
+        results += getKeys(findByProps("CloudUpload")?.CloudUpload, "CloudUpload Class (findByProps('CloudUpload').CloudUpload)") + "\n";
 
-        return React.createElement(ReactNative.View, { style: { flex: 1, backgroundColor: "#2f3136", padding: 10 } },
-            React.createElement(ReactNative.Text, { style: { color: "white", fontSize: 18, fontWeight: "bold", marginBottom: 10 } }, "Module Inspector"),
-            React.createElement(ReactNative.ScrollView, { style: { flex: 1, marginBottom: 10 } },
-                React.createElement(Forms.FormRow, { 
-                    label: "1. Inspect Core Uploader",
-                    subLabel: "Looks for the main 'upload' function.",
-                    onPress: () => inspectModule("Core Uploader (findByProps('upload'))", () => findByProps("upload"))
-                }),
-                React.createElement(Forms.FormRow, { 
-                    label: "2. Inspect File Uploader",
-                    subLabel: "Looks for 'uploadLocalFiles'.",
-                    onPress: () => inspectModule("File Uploader (findByProps('uploadLocalFiles'))", () => findByProps("uploadLocalFiles", "CloudUpload"))
-                }),
-                React.createElement(Forms.FormRow, { 
-                    label: "3. Inspect CloudUpload Module",
-                    subLabel: "Looks for the 'CloudUpload' class.",
-                    onPress: () => inspectModule("CloudUpload Module (findByProps('CloudUpload'))", () => findByProps("CloudUpload"))
-                }),
-            ),
-            React.createElement(ReactNative.Text, { style: { color: "#b9bbbe", fontSize: 14, marginBottom: 5 } }, "Results:"),
-            React.createElement(ReactNative.ScrollView, { style: { backgroundColor: "#202225", padding: 10, borderRadius: 5, flex: 2 } },
-                React.createElement(ReactNative.Text, { selectable: true, style: { color: "white", fontFamily: "monospace" } }, results)
-            ),
-             React.createElement(ReactNative.View, { style: { flexDirection: "row", justifyContent: "space-around", marginTop: 10 } },
-                React.createElement(Forms.FormButton, { title: "Copy Results", onPress: copyToClipboard, style: { flex: 1, marginRight: 5 } }),
-                React.createElement(Forms.FormButton, { title: "Clear", onPress: reset, style: { flex: 1, marginLeft: 5 }, color: "red" })
-            )
-        );
+        return results;
     };
 
-    // --- Plugin Lifecycle (designed to be un-crashable) ---
-    plugin.onLoad = () => {};
-    plugin.onUnload = () => {};
-    plugin.settings = InspectorComponent;
 
-})({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);
+    // --- 3. The Slash Command Definition ---
+    const defineCommand = () => {
+        try {
+            unregister = commands.registerCommand({
+                name: "inspect",
+                displayName: "inspect",
+                description: "Inspects client modules for compatibility.",
+                displayDescription: "Inspects client modules for compatibility.",
+                options: [],
+                applicationId: "-1", // Internal command
+                inputType: 1,
+                type: 1,
+                execute: (args, context) => {
+                    try {
+                        const inspectionResults = runInspection();
+                        
+                        // Use the DCDChat module to send a private (ephemeral) message
+                        DCDChat.createBotMessage({
+                            channelId: context.channel.id,
+                            content: "✅ **Module Inspector Results**\n\nHere is the data from your client. Please copy the entire content of this code block and send it back.",
+                            embeds: [{
+                                type: "rich",
+                                description: "```ini\n" + inspectionResults + "\n```"
+                            }]
+                        });
+
+                    } catch (e) {
+                         DCDChat.createBotMessage({
+                            channelId: context.channel.id,
+                            content: `❌ **Inspector Error:**\nAn error occurred while running the inspection:\n\`\`\`\n${e.message}\n\`\`\``
+                        });
+                    }
+                }
+            });
+        } catch (e) {
+            console.error("[Inspector] Failed to register command:", e);
+            toasts.showToast("Failed to register /inspect command.", getAssetIDByName("Small"));
+        }
+    };
+
+    // --- 4. Plugin Lifecycle (No Settings) ---
+    plugin.onLoad = () => {
+        defineCommand();
+    };
+
+    plugin.onUnload = () => {
+        unregister?.();
+    };
+    
+    // No settings export means no cog wheel icon will be shown.
+    
+})(...vendetta.plugin.runtimeArgs);
+
