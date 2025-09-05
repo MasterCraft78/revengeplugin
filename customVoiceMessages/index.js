@@ -1,30 +1,69 @@
 (function(f, s, c, a, o, l, _, v, h, p) {
     "use strict";
 
-    function w(e) {
-        e?.mimeType?.startsWith("audio") && (e.mimeType = "audio/ogg", e.waveform = "AEtWPyUaGA4OEAcA", e.durationSecs = 60)
+    async function generateWaveformData(file) {
+        try {
+            const audioContext = new(window.AudioContext || window.webkitAudioContext)();
+            const arrayBuffer = await file.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            const durationSecs = Math.round(audioBuffer.duration);
+            const rawData = audioBuffer.getChannelData(0);
+            const samples = 128;
+            const blockSize = Math.floor(rawData.length / samples);
+            const filteredData = [];
+            for (let i = 0; i < samples; i++) {
+                let blockStart = blockSize * i;
+                let sum = 0;
+                for (let j = 0; j < blockSize; j++) {
+                    sum += Math.abs(rawData[blockStart + j]);
+                }
+                filteredData.push(sum / blockSize);
+            }
+            const multiplier = Math.pow(Math.max(...filteredData), -1);
+            const normalizedData = filteredData.map(n => Math.min(255, Math.floor((n * multiplier) * 255)));
+            const waveformBytes = new Uint8Array(normalizedData);
+            const binString = Array.from(waveformBytes, byte => String.fromCodePoint(byte)).join("");
+            const waveform = btoa(binString);
+            return {
+                waveform,
+                durationSecs
+            };
+        } catch (err) {
+            console.error("Failed to process audio file:", err);
+            return null;
+        }
     }
 
     function P() {
         const e = [],
             t = function(n) {
                 try {
-                    const u = s.findByProps(n),
-                        r = c.before(n, u, function(A) {
-                            const i = A[0];
-                            if (!a.storage.sendAsVM || i.flags === 8192) return;
-                            const m = i.items?.[0] ?? i;
-                            m?.mimeType?.startsWith("audio") && (w(m), i.flags = 8192)
-                        });
-                    e.push(r)
+                    const u = s.findByProps(n);
+                    const r = c.instead(n, u, async function(args, originalFunc) {
+                        const uploadData = args[0];
+                        if (!a.storage.sendAsVM || uploadData.flags === 8192) {
+                            return originalFunc.apply(this, args);
+                        }
+                        const item = uploadData.items?.[0] ?? uploadData;
+                        if (item?.mimeType?.startsWith("audio") && item.file) {
+                            const audioData = await generateWaveformData(item.file);
+                            if (audioData) {
+                                item.waveform = audioData.waveform;
+                                item.durationSecs = audioData.durationSecs;
+                                uploadData.flags = 8192;
+                                item.mimeType = "audio/ogg";
+                            }
+                        }
+                        return originalFunc.apply(this, args);
+                    });
+                    e.push(r);
                 } catch {}
             };
-        return t("uploadLocalFiles"), t("CloudUpload"),
-            function() {
-                return e.forEach(function(n) {
-                    return n()
-                })
-            }
+        t("uploadLocalFiles");
+        t("CloudUpload");
+        return function() {
+            e.forEach(n => n());
+        };
     }
 
     function V() {
@@ -173,3 +212,5 @@
     return f.onUnload = H, f.settings = F, f
 })({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);
 
+
+                            
