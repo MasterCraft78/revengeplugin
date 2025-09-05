@@ -1,9 +1,12 @@
 /**
- * CustomVoiceMessages (Hybrid Build)
+ * CustomVoiceMessages (Final Boss Build)
  *
- * This version is a hybrid, combining the stable patching method from the working
- * 'catbox.moe' plugin with the real waveform generation logic. This should
- * finally fix the startup crash and allow the plugin to be enabled.
+ * This definitive version combines all our discoveries:
+ * 1. The stable loading architecture from the working 'Hybrid Build'.
+ * 2. The precise, correct patching logic from the original plugin source.
+ * 3. Our powerful, real waveform generation logic.
+ *
+ * This should finally provide a stable, fully functional plugin.
  *
  * Original Authors: Dziurwa, シグマ siguma
  * Rebuilt By: Gemini
@@ -11,13 +14,15 @@
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    // --- 1. Import necessary modules, similar to catbox.moe ---
+    // --- 1. Import necessary modules ---
     const { React, ReactNative } = common;
     const { findByProps } = metro;
     const { before } = patcher;
     const { Forms } = components;
     const { getAssetIDByName } = assets;
     const { showToast } = ui.toasts;
+
+    const allPatches = [];
 
     // --- 2. The Real Waveform Generation Logic (Our core feature) ---
     async function generateRealWaveform(file) {
@@ -59,69 +64,55 @@
             return { waveform: waveformBase64, duration: decoded.duration };
         } catch (e) {
             console.error("[CVM] Waveform generation failed:", e);
-            // Fallback to a default waveform if something goes wrong
             return { waveform: "AEtWPyUaGA4OEAcA", duration: 60.0 };
         }
     }
 
-    // --- 3. The Stable Patching Method (Learned from catbox.moe) ---
-    function applyPatch() {
-        // Find the fundamental 'CloudUpload' module, which we know exists.
-        const CloudUploadModule = findByProps("CloudUpload")?.CloudUpload;
-        if (!CloudUploadModule) {
-            console.error("[CVM] Could not find CloudUpload module. Cannot apply patch.");
-            showToast("CVM Error: Could not find Upload module.", getAssetIDByName("Small"));
+    // --- 3. The Correct Patching Method (Learned from the original source) ---
+    function applyPatches() {
+        // Find the module containing the upload functions.
+        const UploaderModule = findByProps("uploadLocalFiles", "CloudUpload");
+        if (!UploaderModule) {
+            console.error("[CVM] Could not find Uploader Module. Plugin disabled.");
             return;
         }
 
-        // Save the original function we are about to modify.
-        const originalFunction = CloudUploadModule.prototype.reactNativeCompressAndExtractData;
+        // We patch both local file uploads and cloud uploads.
+        const methodsToPatch = ["uploadLocalFiles", "CloudUpload"];
+        methodsToPatch.forEach(method => {
+            if (typeof UploaderModule[method] !== 'function') return;
 
-        // Overwrite the original function with our new, modified version.
-        CloudUploadModule.prototype.reactNativeCompressAndExtractData = async function(...args) {
-            // 'this' refers to the upload instance
-            const uploadInstance = this;
-            const fileType = uploadInstance?.mimeType ?? "";
-            const shouldIntercept = storage.sendAsVM && fileType.startsWith("audio");
+            allPatches.push(before(method, UploaderModule, (args) => {
+                // The first argument is the main upload task object.
+                const uploadTask = args[0];
+                if (!storage.sendAsVM || uploadTask.flags === 8192) return;
 
-            // If it's not an audio file we care about, just run the original Discord code.
-            if (!shouldIntercept) {
-                return originalFunction.apply(this, args);
-            }
-            
-            showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
+                // The file itself is usually in an 'items' array.
+                const fileItem = uploadTask.items?.[0] ?? uploadTask;
 
-            try {
-                // Generate our real waveform and duration from the audio file.
-                const { waveform, duration } = await generateRealWaveform(uploadInstance);
+                if (fileItem?.mimeType?.startsWith("audio")) {
+                    // This is an async operation, but we don't need to wait for it.
+                    // We can modify the objects by reference and let the promise resolve.
+                    (async () => {
+                        try {
+                            showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
+                            const { waveform, duration } = await generateRealWaveform(fileItem);
 
-                // Modify the upload instance to trick Discord into thinking it's a voice message.
-                uploadInstance.mimeType = "audio/ogg";
-                uploadInstance.waveform = waveform;
-                uploadInstance.durationSecs = duration;
-                
-                // This is a crucial step from the original CVM source.
-                // We set flags to 8192 to mark it as a voice message.
-                // This is done on the parent upload object, not just our instance.
-                const uploader = findByProps("uploadLocalFiles")
-                if(uploader?.upload) uploader.upload.flags = 8192;
+                            // Modify the file item itself
+                            fileItem.mimeType = "audio/ogg";
+                            fileItem.waveform = waveform;
+                            fileItem.durationSecs = duration;
 
-
-                // Now that we've modified it, let Discord continue with its original logic.
-                return originalFunction.apply(this, args);
-
-            } catch (e) {
-                console.error("[CVM] Error during voice message conversion:", e);
-                showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
-                // If we fail, fall back to the original function to prevent a crash.
-                return originalFunction.apply(this, args);
-            }
-        };
-
-        // Return a function that restores the original code when the plugin is unloaded.
-        return () => {
-            CloudUploadModule.prototype.reactNativeCompressAndExtractData = originalFunction;
-        };
+                            // THIS IS THE SECRET: Set the flag on the main task object.
+                            uploadTask.flags = 8192;
+                        } catch(e) {
+                            console.error("[CVM] Failed to process audio file:", e);
+                            showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
+                        }
+                    })();
+                }
+            }));
+        });
     }
 
     // --- 4. Settings UI ---
@@ -140,20 +131,18 @@
         );
     }
     
-    // --- 5. Plugin Lifecycle ---
-    let unpatch;
-    
+    // --- 5. Plugin Lifecycle (Safe Loading) ---
     plugin.onLoad = () => {
         try {
             storage.sendAsVM ??= true;
-            unpatch = applyPatch();
+            applyPatches();
         } catch (e) {
             console.error("[CVM] Failed to load plugin:", e);
         }
     };
     
     plugin.onUnload = () => {
-        unpatch?.();
+        allPatches.forEach(p => p?.());
     };
     
     plugin.settings = SettingsComponent;
