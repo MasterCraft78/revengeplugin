@@ -1,12 +1,9 @@
 /**
- * CustomVoiceMessages (Final Boss Build)
+ * CustomVoiceMessages (Frankenstein Build)
  *
- * This definitive version combines all our discoveries:
- * 1. The stable loading architecture from the working 'Hybrid Build'.
- * 2. The precise, correct patching logic from the original plugin source.
- * 3. Our powerful, real waveform generation logic.
- *
- * This should finally provide a stable, fully functional plugin.
+ * This is the final attempt, combining all our knowledge into the most resilient
+ * version possible. It uses two separate patching methods, each with its own
+ * safety net to prevent the plugin from crashing on load.
  *
  * Original Authors: Dziurwa, シグマ siguma
  * Rebuilt By: Gemini
@@ -14,7 +11,7 @@
 (function(plugin, metro, patcher, self, common, assets, utils, ui, components, storage) {
     "use strict";
 
-    // --- 1. Import necessary modules ---
+    // --- 1. Modules & Setup ---
     const { React, ReactNative } = common;
     const { findByProps } = metro;
     const { before } = patcher;
@@ -24,19 +21,17 @@
 
     const allPatches = [];
 
-    // --- 2. The Real Waveform Generation Logic (Our core feature) ---
+    // --- 2. The Real Waveform Generation Logic ---
     async function generateRealWaveform(file) {
         try {
             const AudioContext = window.AudioContext || window.webkitAudioContext;
             if (!AudioContext) throw new Error("AudioContext not supported");
-
             const arrayBuffer = await new Promise((res, rej) => {
                 const reader = new FileReader();
                 reader.onload = () => res(reader.result);
                 reader.onerror = (err) => rej(err);
                 reader.readAsArrayBuffer(file);
             });
-
             const audioCtx = new AudioContext();
             const decoded = await audioCtx.decodeAudioData(arrayBuffer);
             const rawData = decoded.getChannelData(0);
@@ -44,7 +39,6 @@
             const blockSize = Math.floor(rawData.length / waveformPoints);
             const peaks = new Uint8Array(waveformPoints);
             let maxPeak = 0;
-
             for (let i = 0; i < waveformPoints; i++) {
                 let sum = 0;
                 for (let j = 0; j < blockSize; j++) {
@@ -54,7 +48,6 @@
                 if (avg > maxPeak) maxPeak = avg;
                 peaks[i] = avg;
             }
-
             if (maxPeak > 0) {
                 for (let i = 0; i < waveformPoints; i++) {
                     peaks[i] = Math.floor((peaks[i] / maxPeak) * 63);
@@ -68,52 +61,54 @@
         }
     }
 
-    // --- 3. The Correct Patching Method (Learned from the original source) ---
-    function applyPatches() {
-        // Find the module containing the upload functions.
+    // --- 3. The Two-Part Patching System ---
+
+    // Part A: Modify the file item itself. (Stable 'catbox.moe' method)
+    function patchFileItem() {
+        const CloudUploadModule = findByProps("CloudUpload")?.CloudUpload;
+        if (!CloudUploadModule) {
+            console.error("[CVM] Could not find CloudUpload module for Part A.");
+            return; // Exit if not found, but don't crash
+        }
+        const originalFunction = CloudUploadModule.prototype.reactNativeCompressAndExtractData;
+        CloudUploadModule.prototype.reactNativeCompressAndExtractData = async function(...args) {
+            const uploadInstance = this;
+            if (storage.sendAsVM && uploadInstance?.mimeType?.startsWith("audio")) {
+                const { waveform, duration } = await generateRealWaveform(uploadInstance);
+                uploadInstance.mimeType = "audio/ogg";
+                uploadInstance.waveform = waveform;
+                uploadInstance.durationSecs = duration;
+            }
+            return originalFunction.apply(this, args);
+        };
+        // Return the unpatch function
+        return () => {
+            CloudUploadModule.prototype.reactNativeCompressAndExtractData = originalFunction;
+        };
+    }
+
+    // Part B: Modify the main upload task. (Original CVM method)
+    function patchUploadTask() {
         const UploaderModule = findByProps("uploadLocalFiles", "CloudUpload");
         if (!UploaderModule) {
-            console.error("[CVM] Could not find Uploader Module. Plugin disabled.");
-            return;
+            console.error("[CVM] Could not find UploaderModule for Part B.");
+            return; // Exit if not found, but don't crash
         }
+        const method = "uploadLocalFiles"; // Target the most common upload method
+        if (typeof UploaderModule[method] !== 'function') return;
 
-        // We patch both local file uploads and cloud uploads.
-        const methodsToPatch = ["uploadLocalFiles", "CloudUpload"];
-        methodsToPatch.forEach(method => {
-            if (typeof UploaderModule[method] !== 'function') return;
-
-            allPatches.push(before(method, UploaderModule, (args) => {
-                // The first argument is the main upload task object.
-                const uploadTask = args[0];
-                if (!storage.sendAsVM || uploadTask.flags === 8192) return;
-
-                // The file itself is usually in an 'items' array.
-                const fileItem = uploadTask.items?.[0] ?? uploadTask;
-
-                if (fileItem?.mimeType?.startsWith("audio")) {
-                    // This is an async operation, but we don't need to wait for it.
-                    // We can modify the objects by reference and let the promise resolve.
-                    (async () => {
-                        try {
-                            showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
-                            const { waveform, duration } = await generateRealWaveform(fileItem);
-
-                            // Modify the file item itself
-                            fileItem.mimeType = "audio/ogg";
-                            fileItem.waveform = waveform;
-                            fileItem.durationSecs = duration;
-
-                            // THIS IS THE SECRET: Set the flag on the main task object.
-                            uploadTask.flags = 8192;
-                        } catch(e) {
-                            console.error("[CVM] Failed to process audio file:", e);
-                            showToast("❌ Voice Message conversion failed.", getAssetIDByName("Small"));
-                        }
-                    })();
-                }
-            }));
+        const unpatch = before(method, UploaderModule, (args) => {
+            const uploadTask = args[0];
+            const fileItem = uploadTask.items?.[0] ?? uploadTask;
+            if (storage.sendAsVM && fileItem?.mimeType?.startsWith("audio")) {
+                showToast("🎵 Converting to Voice Message...", getAssetIDByName("music"));
+                uploadTask.flags = 8192;
+            }
         });
+        // Return the unpatch function
+        return unpatch;
     }
+
 
     // --- 4. Settings UI ---
     function SettingsComponent() {
@@ -130,21 +125,37 @@
             )
         );
     }
-    
-    // --- 5. Plugin Lifecycle (Safe Loading) ---
+
+    // --- 5. Plugin Lifecycle (with individual safety nets) ---
     plugin.onLoad = () => {
+        storage.sendAsVM ??= true;
+
+        // Safety Net for Part A
         try {
-            storage.sendAsVM ??= true;
-            applyPatches();
+            const unpatchA = patchFileItem();
+            if (unpatchA) allPatches.push(unpatchA);
         } catch (e) {
-            console.error("[CVM] Failed to load plugin:", e);
+            console.error("[CVM] FAILED to apply Patch A (File Item):", e);
+        }
+
+        // Safety Net for Part B
+        try {
+            const unpatchB = patchUploadTask();
+            if (unpatchB) allPatches.push(unpatchB);
+        } catch (e) {
+            console.error("[CVM] FAILED to apply Patch B (Upload Task):", e);
+        }
+
+        if (allPatches.length === 0) {
+            showToast("CVM failed to load any patches.", getAssetIDByName("Small"));
         }
     };
-    
+
     plugin.onUnload = () => {
         allPatches.forEach(p => p?.());
+        allPatches.length = 0; // Clear the array
     };
-    
+
     plugin.settings = SettingsComponent;
 
 })({}, vendetta.metro, vendetta.patcher, vendetta.plugin, vendetta.metro.common, vendetta.ui.assets, vendetta.utils, vendetta.ui, vendetta.ui.components, vendetta.storage);
